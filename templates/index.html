@@ -12,6 +12,20 @@ h1{font-size:1.5rem;font-weight:700;margin-bottom:4px;color:#f8fafc}
 .card{background:#1e2432;border:1px solid #2d3748;border-radius:12px;padding:20px;margin-bottom:16px}
 .card-title{font-size:.8rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b;margin-bottom:12px}
 
+/* Token management */
+.token-row{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #2d3748}
+.token-row:last-child{border-bottom:none}
+.token-name{flex:1;font-size:.85rem;font-weight:500}
+.token-value{font-family:monospace;font-size:.75rem;color:#6366f1;background:#0f1117;padding:3px 7px;border-radius:4px;cursor:pointer;word-break:break-all;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.token-new-value{font-family:monospace;font-size:.8rem;color:#34d399;background:#0f2a1e;border:1px solid #065f46;padding:8px 10px;border-radius:6px;margin-top:8px;word-break:break-all}
+.token-create-row{display:flex;gap:8px;margin-top:12px}
+.token-create-row input{flex:1;background:#0f1117;border:1px solid #2d3748;color:#e2e8f0;border-radius:6px;padding:6px 10px;font-size:.875rem;outline:none}
+.token-create-row input:focus{border-color:#6366f1}
+
+/* Date group header */
+.date-group{margin-bottom:4px}
+.date-group-label{font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#475569;padding:12px 0 6px;border-bottom:1px solid #1e2432;margin-bottom:8px}
+
 /* Model status */
 #model-status{display:flex;align-items:center;gap:8px;font-size:.8rem;margin-bottom:16px}
 .dot{width:8px;height:8px;border-radius:50%;background:#f59e0b;animation:pulse 1.5s infinite}
@@ -130,6 +144,16 @@ select{min-width:140px}
   <div id="jobs-container"><div class="empty-state">Noch keine Aufträge</div></div>
 </div>
 
+<div class="card" id="tokens-card" style="display:none">
+  <div class="card-title">App-Tokens (iOS / API)</div>
+  <div id="tokens-list"></div>
+  <div class="token-create-row">
+    <input type="text" id="token-name-input" placeholder="Name des Tokens (z.B. iPhone von Mert)">
+    <button class="btn btn-primary" onclick="createToken()">Erstellen</button>
+  </div>
+  <div id="new-token-box"></div>
+</div>
+
 <div id="toast"></div>
 
 <script>
@@ -236,6 +260,22 @@ async function refreshJobs() {
   }
 }
 
+function groupByDate(jobs) {
+  const today = new Date(); today.setHours(0,0,0,0);
+  const yesterday = new Date(today); yesterday.setDate(yesterday.getDate()-1);
+  const groups = new Map();
+  jobs.forEach(job => {
+    const d = new Date(job.created_at * 1000); d.setHours(0,0,0,0);
+    let label;
+    if (d.getTime() === today.getTime()) label = 'Heute';
+    else if (d.getTime() === yesterday.getTime()) label = 'Gestern';
+    else label = d.toLocaleDateString('de-DE', {weekday:'long', day:'2-digit', month:'2-digit', year:'numeric'});
+    if (!groups.has(label)) groups.set(label, []);
+    groups.get(label).push(job);
+  });
+  return groups;
+}
+
 function renderJobs(jobs) {
   const container = document.getElementById('jobs-container');
   if (!jobs.length) {
@@ -243,65 +283,76 @@ function renderJobs(jobs) {
     return;
   }
 
-  // Keep expanded segments state
   const expanded = {};
   container.querySelectorAll('.segments').forEach(el => {
     if (el.style.display !== 'none') expanded[el.dataset.jobId] = true;
   });
 
   container.innerHTML = '';
-  jobs.forEach(job => {
-    const div = document.createElement('div');
-    div.className = 'job';
-    div.dataset.jobId = job.id;
+  const groups = groupByDate(jobs);
 
-    const canCancel = ['queued','processing'].includes(job.status);
-    const canDelete = ['done','error','cancelled'].includes(job.status);
-    const isDone = job.status === 'done';
+  groups.forEach((groupJobs, label) => {
+    const groupDiv = document.createElement('div');
+    groupDiv.className = 'date-group';
+    groupDiv.innerHTML = `<div class="date-group-label">${escHtml(label)}</div>`;
 
-    let actionsHtml = '';
-    if (canCancel) actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="cancelJob('${job.id}')">Abbrechen</button>`;
-    if (isDone) {
-      actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="copyText('${job.id}')">Kopieren</button>`;
-      actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="downloadFmt('${job.id}','txt')">TXT</button>`;
-      actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="downloadFmt('${job.id}','srt')">SRT</button>`;
-      actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="downloadFmt('${job.id}','json')">JSON</button>`;
-    }
-    if (canDelete) actionsHtml += `<button class="btn btn-danger btn-sm" onclick="deleteJob('${job.id}')">Löschen</button>`;
+    groupJobs.forEach(job => {
+      const div = document.createElement('div');
+      div.className = 'job';
+      div.dataset.jobId = job.id;
 
-    let progressHtml = '';
-    if (['queued','processing','cancelling'].includes(job.status)) {
-      progressHtml = `<div class="progress-bar"><div class="progress-fill" style="width:${job.progress}%"></div></div>`;
-    }
+      const canCancel = ['queued','processing'].includes(job.status);
+      const canRetry  = ['error','cancelled'].includes(job.status);
+      const canDelete = ['done','error','cancelled'].includes(job.status);
+      const isDone    = job.status === 'done';
 
-    let durationHtml = job.duration ? ` · ${job.duration}s` : '';
-    let modelHtml = job.model ? ` · ${job.model}` : '';
-
-    div.innerHTML = `
-      <div class="job-header">
-        <div>
-          <div class="job-name">${escHtml(job.filename)}</div>
-          <div class="job-meta">${new Date(job.created_at*1000).toLocaleTimeString('de-DE')}${durationHtml}${modelHtml}</div>
-        </div>
-        <span class="badge ${job.status}">${statusLabel(job.status)}</span>
-      </div>
-      ${progressHtml}
-      ${job.error ? `<div style="color:#f87171;font-size:.75rem;margin-top:4px">${escHtml(job.error)}</div>` : ''}
-      <div class="actions">${actionsHtml}</div>
-    `;
-
-    // Fetch and render transcript if done
-    if (isDone) {
-      knownJobs[job.id] = knownJobs[job.id] || {};
-      if (!knownJobs[job.id].loaded) {
-        knownJobs[job.id].loaded = true;
-        loadJobDetail(job.id, div, expanded[job.id]);
-      } else {
-        appendTranscript(div, knownJobs[job.id].data, expanded[job.id]);
+      let actionsHtml = '';
+      if (canCancel) actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="cancelJob('${job.id}')">Abbrechen</button>`;
+      if (canRetry)  actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="retryJob('${job.id}')">Wiederholen</button>`;
+      if (isDone) {
+        actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="copyText('${job.id}')">Kopieren</button>`;
+        actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="downloadFmt('${job.id}','txt')">TXT</button>`;
+        actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="downloadFmt('${job.id}','srt')">SRT</button>`;
+        actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="downloadFmt('${job.id}','json')">JSON</button>`;
       }
-    }
+      if (canDelete) actionsHtml += `<button class="btn btn-danger btn-sm" onclick="deleteJob('${job.id}')">Löschen</button>`;
 
-    container.appendChild(div);
+      let progressHtml = '';
+      if (['queued','processing','cancelling'].includes(job.status)) {
+        progressHtml = `<div class="progress-bar"><div class="progress-fill" style="width:${job.progress}%"></div></div>`;
+      }
+
+      const time = new Date(job.created_at*1000).toLocaleTimeString('de-DE', {hour:'2-digit', minute:'2-digit'});
+      const durationHtml = job.duration ? ` · ${job.duration}s` : '';
+      const modelHtml = job.model ? ` · ${job.model}` : '';
+
+      div.innerHTML = `
+        <div class="job-header">
+          <div>
+            <div class="job-name">${escHtml(job.filename)}</div>
+            <div class="job-meta">${time}${durationHtml}${modelHtml}</div>
+          </div>
+          <span class="badge ${job.status}">${statusLabel(job.status)}</span>
+        </div>
+        ${progressHtml}
+        ${job.error ? `<div style="color:#f87171;font-size:.75rem;margin-top:4px">${escHtml(job.error)}</div>` : ''}
+        <div class="actions">${actionsHtml}</div>
+      `;
+
+      if (isDone) {
+        knownJobs[job.id] = knownJobs[job.id] || {};
+        if (!knownJobs[job.id].loaded) {
+          knownJobs[job.id].loaded = true;
+          loadJobDetail(job.id, div, expanded[job.id]);
+        } else {
+          appendTranscript(div, knownJobs[job.id].data, expanded[job.id]);
+        }
+      }
+
+      groupDiv.appendChild(div);
+    });
+
+    container.appendChild(groupDiv);
   });
 }
 
@@ -354,6 +405,17 @@ async function cancelJob(id) {
   refreshJobs();
 }
 
+async function retryJob(id) {
+  const r = await apiFetch(`/api/jobs/${id}/retry`, {method:'POST'});
+  if (r.ok) {
+    showToast('Transkription wird wiederholt');
+    refreshJobs();
+  } else {
+    const d = await r.json().catch(() => ({}));
+    showToast('Fehler: ' + (d.error || r.status), true);
+  }
+}
+
 async function deleteJob(id) {
   await apiFetch(`/api/jobs/${id}/delete`, {method:'DELETE'});
   delete knownJobs[id];
@@ -402,6 +464,65 @@ function showToast(msg, isError = false) {
 }
 
 refreshJobs();
+
+// Token management (only shown for browser sessions authenticated via Authelia)
+async function loadTokens() {
+  try {
+    const r = await fetch('/tokens');
+    if (!r.ok) return; // not a browser session — hide section
+    const tokens = await r.json();
+    document.getElementById('tokens-card').style.display = '';
+    renderTokens(tokens);
+  } catch(e) {}
+}
+
+function renderTokens(tokens) {
+  const list = document.getElementById('tokens-list');
+  if (!tokens.length) {
+    list.innerHTML = '<div class="empty-state" style="padding:16px 0">Noch keine Tokens</div>';
+    return;
+  }
+  list.innerHTML = tokens.map(t => `
+    <div class="token-row">
+      <span class="token-name">${escHtml(t.name)}</span>
+      <span class="token-value" title="Klicken zum Kopieren" onclick="copyToken('${escHtml(t.id)}')">${escHtml(t.id)}</span>
+      <button class="btn btn-danger btn-sm" onclick="deleteToken('${escHtml(t.id)}')">Löschen</button>
+    </div>
+  `).join('');
+}
+
+async function createToken() {
+  const input = document.getElementById('token-name-input');
+  const name = input.value.trim();
+  if (!name) return;
+  const r = await fetch('/tokens/create', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name})
+  });
+  const d = await r.json();
+  if (!r.ok) { showToast('Fehler: ' + (d.error || r.status), true); return; }
+  input.value = '';
+  document.getElementById('new-token-box').innerHTML =
+    `<div class="token-new-value">Token (nur einmal sichtbar — jetzt kopieren!):<br>${escHtml(d.token)}</div>`;
+  await loadTokens();
+}
+
+async function deleteToken(tokenValue) {
+  if (!confirm('Token wirklich löschen?')) return;
+  const r = await fetch(`/tokens/${encodeURIComponent(tokenValue)}/delete`, {method:'POST'});
+  if (r.ok) { await loadTokens(); showToast('Token gelöscht'); }
+  else showToast('Fehler beim Löschen', true);
+}
+
+async function copyToken(value) {
+  try {
+    await navigator.clipboard.writeText(value);
+    showToast('Token kopiert');
+  } catch(e) { showToast('Kopieren fehlgeschlagen', true); }
+}
+
+loadTokens();
 </script>
 </body>
 </html>

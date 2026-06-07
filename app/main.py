@@ -6,24 +6,39 @@ import threading
 import subprocess
 import tempfile
 import shutil
+import secrets
 from pathlib import Path
 from datetime import datetime
 from collections import OrderedDict
 
-import requests as http_requests
-from flask import Flask, request, jsonify, render_template, abort, send_file, Response
+from flask import Flask, request, jsonify, render_template, abort, send_file, Response, session
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__, template_folder="../templates")
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
+app.config["SESSION_COOKIE_SECURE"] = True
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Strict"
 
-AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "")
 TRUST_PROXY_AUTH = os.environ.get("TRUST_PROXY_AUTH", "true").lower() == "true"
-OIDC_ISSUER = os.environ.get("OIDC_ISSUER", "")
-OIDC_CLIENT_ID = os.environ.get("OIDC_CLIENT_ID", "whisper-ios")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
 TRANSCRIPTS_DIR = Path("/transcripts")
 MODEL_CACHE_DIR = Path("/model_cache")
+TOKENS_FILE = TRANSCRIPTS_DIR / ".tokens.json"
 TRANSCRIPTS_DIR.mkdir(exist_ok=True)
+
+_tokens_lock = threading.Lock()
+
+
+def _load_tokens() -> dict:
+    try:
+        return json.loads(TOKENS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _save_tokens(tokens: dict):
+    TOKENS_FILE.write_text(json.dumps(tokens, indent=2))
 
 ALLOWED_EXTENSIONS = {"m4a", "mp3", "wav", "ogg", "flac", "webm", "mp4"}
 
@@ -43,42 +58,35 @@ DEFAULT_PROMPT = (
 )
 
 
-def _validate_oidc_token(token: str) -> bool:
-    """Ask Authelia's userinfo endpoint if the Bearer token is valid."""
-    if not OIDC_ISSUER:
-        return False
-    try:
-        r = http_requests.get(
-            f"{OIDC_ISSUER}/api/oidc/userinfo",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=3,
-        )
-        return r.status_code == 200
-    except Exception as e:
-        print(f"OIDC userinfo error: {e}", flush=True)
-        return False
-
-
-def check_auth(req):
-    # 1. Authelia forward-auth setzt Remote-User für Browser-Sessions
+def check_auth(req) -> bool:
+    # Authelia sets Remote-User on routes going through whisper-ui router
     if TRUST_PROXY_AUTH:
         if req.headers.get("Remote-User") or req.headers.get("X-Forwarded-User"):
             return True
 
+    # Flask session cookie — set when browser loads GET / through Authelia.
+    # Allows browser AJAX calls to /api/* (whisper-api router, no Authelia) to
+    # authenticate without re-checking Authelia on every request.
+    if session.get("authenticated"):
+        return True
+
+    # iOS / API clients: Bearer token from static token list
     auth_header = req.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
-        # 2. OIDC Bearer Token → Authelia userinfo-Validierung
-        if _validate_oidc_token(token):
-            return True
-        # 3. Statischer AUTH_TOKEN (Entwicklung / Fallback)
-        if AUTH_TOKEN and token == AUTH_TOKEN:
-            return True
-
-    if AUTH_TOKEN and req.args.get("token") == AUTH_TOKEN:
-        return True
+        with _tokens_lock:
+            tokens = _load_tokens()
+        return token in tokens
 
     return False
+
+
+def is_browser_auth(req) -> bool:
+    """True if request came through Authelia or has a browser session cookie."""
+    if TRUST_PROXY_AUTH:
+        if req.headers.get("Remote-User") or req.headers.get("X-Forwarded-User"):
+            return True
+    return bool(session.get("authenticated"))
 
 
 def get_whisper_model():
@@ -273,15 +281,16 @@ def transcribe_job(job_id: str):
     finally:
         if tmp_dir and os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
-        # Clean up uploaded file
+        # Only delete the uploaded audio file on success — keep it for error/cancelled so retry works
         with jobs_lock:
             job = jobs.get(job_id, {})
-        file_path = job.get("file_path", "")
-        if file_path and os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except Exception:
-                pass
+        if job.get("status") == "done":
+            file_path = job.get("file_path", "")
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
 
 
 def worker():
@@ -314,18 +323,58 @@ def require_auth():
 
 @app.route("/")
 def index():
+    # When Authelia authenticates the browser, set a session cookie so that
+    # AJAX calls to /api/* (whisper-api router, no Authelia middleware) also
+    # get authenticated via Flask session instead of Remote-User header.
+    if request.headers.get("Remote-User") or request.headers.get("X-Forwarded-User"):
+        session["authenticated"] = True
     return render_template("index.html", default_prompt=DEFAULT_PROMPT, current_model=WHISPER_MODEL)
 
 
 @app.route("/api/config")
 def api_config():
-    """Liefert OIDC-Konfiguration für die iOS-App (kein Auth nötig)."""
     return jsonify({
-        "oidc_issuer": OIDC_ISSUER,
-        "oidc_client_id": OIDC_CLIENT_ID,
         "model_default": WHISPER_MODEL,
         "models": ["large-v3", "medium", "small", "base"],
     })
+
+
+@app.route("/tokens", methods=["GET"])
+def list_tokens():
+    if not is_browser_auth(request):
+        abort(403)
+    with _tokens_lock:
+        tokens = _load_tokens()
+    return jsonify([{"id": tid, "name": name} for tid, name in tokens.items()])
+
+
+@app.route("/tokens/create", methods=["POST"])
+def create_token():
+    if not is_browser_auth(request):
+        abort(403)
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Name erforderlich"}), 400
+    token_value = str(uuid.uuid4()).replace("-", "") + str(uuid.uuid4()).replace("-", "")
+    with _tokens_lock:
+        tokens = _load_tokens()
+        tokens[token_value] = name
+        _save_tokens(tokens)
+    return jsonify({"name": name, "token": token_value}), 201
+
+
+@app.route("/tokens/<token_value>/delete", methods=["POST"])
+def delete_token(token_value):
+    if not is_browser_auth(request):
+        abort(403)
+    with _tokens_lock:
+        tokens = _load_tokens()
+        if token_value not in tokens:
+            return jsonify({"error": "Not found"}), 404
+        del tokens[token_value]
+        _save_tokens(tokens)
+    return jsonify({"ok": True})
 
 
 @app.route("/health")
@@ -457,11 +506,9 @@ def retry_job(job_id):
         if job["status"] not in ("error", "cancelled"):
             return jsonify({"error": "Only failed/cancelled jobs can be retried"}), 400
 
-        # Re-upload needed since file was deleted — just reset state if file exists
-        # For retry, user should re-upload; this requeues with existing data if file present
         original_path = job.get("file_path", "")
         if not original_path or not os.path.exists(original_path):
-            return jsonify({"error": "Original file no longer available, please re-upload"}), 400
+            return jsonify({"error": "Originaldatei nicht mehr vorhanden, bitte erneut hochladen"}), 400
 
         job["status"] = "queued"
         job["progress"] = 0
@@ -480,6 +527,12 @@ def delete_job(job_id):
         job = jobs.pop(job_id, None)
     if not job:
         return jsonify({"error": "Not found"}), 404
+    file_path = job.get("file_path", "")
+    if file_path and os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
     return jsonify({"ok": True})
 
 
