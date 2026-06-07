@@ -99,6 +99,15 @@ select{min-width:140px}
 /* Toast */
 #toast{position:fixed;bottom:24px;right:24px;background:#1e2432;border:1px solid #2d3748;color:#e2e8f0;padding:10px 16px;border-radius:8px;font-size:.8rem;opacity:0;transition:opacity .3s;pointer-events:none;z-index:999}
 #toast.show{opacity:1}
+
+/* Tabs */
+.tab-bar{display:flex;gap:4px;border-bottom:1px solid #2d3748;margin-bottom:20px;overflow-x:auto;scrollbar-width:none}
+.tab-bar::-webkit-scrollbar{display:none}
+.tab-btn{background:none;border:none;color:#64748b;padding:10px 16px;font-size:.875rem;font-weight:500;cursor:pointer;border-bottom:2px solid transparent;transition:all .15s;white-space:nowrap;font-family:inherit}
+.tab-btn:hover{color:#94a3b8}
+.tab-btn.active{color:#e2e8f0;border-bottom-color:#6366f1}
+.tab-content{display:none}
+.tab-content.active{display:block}
 </style>
 </head>
 <body>
@@ -110,55 +119,67 @@ select{min-width:140px}
   <span id="model-label">Modell wird geladen…</span>
 </div>
 
-<div class="card">
-  <div class="card-title">Einstellungen</div>
-  <div class="settings-row">
-    <div>
-      <label for="model-select">Modell</label>
-      <select id="model-select"></select>
+<div class="tab-bar" id="tab-bar">
+  <button class="tab-btn active" data-tab="transcribe">Transkribieren</button>
+  <button class="tab-btn" data-tab="models" id="tab-models" style="display:none">Modelle</button>
+  <button class="tab-btn" data-tab="tokens" id="tab-tokens" style="display:none">App-Tokens</button>
+</div>
+
+<div class="tab-content active" id="tab-content-transcribe">
+  <div class="card">
+    <div class="card-title">Transkription</div>
+    <div class="settings-row">
+      <div>
+        <label for="model-select">Modell</label>
+        <select id="model-select"></select>
+      </div>
+    </div>
+    <label style="font-size:.8rem;color:#94a3b8;display:block;margin-bottom:4px">Initial Prompt (Fachvokabular)</label>
+    <textarea id="prompt-input">{{ default_prompt }}</textarea>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Dateien hochladen</div>
+    <div id="dropzone">
+      <input type="file" id="file-input" multiple accept=".m4a,.mp3,.wav,.ogg,.flac,.webm,.mp4">
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+      <p><strong>Dateien hierher ziehen</strong> oder klicken</p>
+      <p style="font-size:.75rem;margin-top:4px">m4a, mp3, wav, ogg, flac, webm</p>
+    </div>
+    <div id="file-list" style="margin-top:10px;font-size:.8rem;color:#64748b"></div>
+    <button id="upload-btn" disabled>Hochladen & Transkribieren</button>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Aufträge</div>
+    <div id="jobs-container"><div class="empty-state">Noch keine Aufträge</div></div>
+  </div>
+</div>
+
+<div class="tab-content" id="tab-content-models">
+  <div class="card">
+    <div class="card-title">Modelle</div>
+    <div id="models-list"></div>
+    <div class="token-create-row">
+      <input type="text" id="model-name-input" placeholder="HuggingFace-Name (z.B. Systran/faster-whisper-distil-large-v3)">
+      <button class="btn btn-primary" onclick="addModel()">Hinzufügen</button>
+    </div>
+    <div style="font-size:.7rem;color:#64748b;margin-top:8px">
+      Beim ersten Verwenden wird das Modell automatisch heruntergeladen. CTranslate2-kompatible faster-whisper-Modelle.
     </div>
   </div>
-  <label style="font-size:.8rem;color:#94a3b8;display:block;margin-bottom:4px">Initial Prompt (Fachvokabular)</label>
-  <textarea id="prompt-input">{{ default_prompt }}</textarea>
 </div>
 
-<div class="card">
-  <div class="card-title">Dateien hochladen</div>
-  <div id="dropzone">
-    <input type="file" id="file-input" multiple accept=".m4a,.mp3,.wav,.ogg,.flac,.webm,.mp4">
-    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
-    <p><strong>Dateien hierher ziehen</strong> oder klicken</p>
-    <p style="font-size:.75rem;margin-top:4px">m4a, mp3, wav, ogg, flac, webm</p>
+<div class="tab-content" id="tab-content-tokens">
+  <div class="card">
+    <div class="card-title">App-Tokens (iOS / API)</div>
+    <div id="tokens-list"></div>
+    <div class="token-create-row">
+      <input type="text" id="token-name-input" placeholder="Name des Tokens (z.B. iPhone von Mert)">
+      <button class="btn btn-primary" onclick="createToken()">Erstellen</button>
+    </div>
+    <div id="new-token-box"></div>
   </div>
-  <div id="file-list" style="margin-top:10px;font-size:.8rem;color:#64748b"></div>
-  <button id="upload-btn" disabled>Hochladen & Transkribieren</button>
-</div>
-
-<div class="card">
-  <div class="card-title">Aufträge</div>
-  <div id="jobs-container"><div class="empty-state">Noch keine Aufträge</div></div>
-</div>
-
-<div class="card" id="models-card" style="display:none">
-  <div class="card-title">Modelle</div>
-  <div id="models-list"></div>
-  <div class="token-create-row">
-    <input type="text" id="model-name-input" placeholder="HuggingFace-Name (z.B. Systran/faster-whisper-distil-large-v3)">
-    <button class="btn btn-primary" onclick="addModel()">Hinzufügen</button>
-  </div>
-  <div style="font-size:.7rem;color:#64748b;margin-top:8px">
-    Beim ersten Verwenden wird das Modell automatisch heruntergeladen. CTranslate2-kompatible faster-whisper-Modelle.
-  </div>
-</div>
-
-<div class="card" id="tokens-card" style="display:none">
-  <div class="card-title">App-Tokens (iOS / API)</div>
-  <div id="tokens-list"></div>
-  <div class="token-create-row">
-    <input type="text" id="token-name-input" placeholder="Name des Tokens (z.B. iPhone von Mert)">
-    <button class="btn btn-primary" onclick="createToken()">Erstellen</button>
-  </div>
-  <div id="new-token-box"></div>
 </div>
 
 <div id="toast"></div>
@@ -170,6 +191,26 @@ const authHeader = TOKEN ? {'Authorization': 'Bearer ' + TOKEN} : {};
 function apiFetch(url, opts = {}) {
   opts.headers = Object.assign({}, authHeader, opts.headers || {});
   return fetch(url, opts);
+}
+
+// ── Tabs ───────────────────────────────────────────────────────────────
+function switchTab(name) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === 'tab-content-' + name));
+  if (location.hash.slice(1) !== name) history.replaceState(null, '', '#' + name);
+}
+document.getElementById('tab-bar').addEventListener('click', e => {
+  const btn = e.target.closest('.tab-btn');
+  if (btn) switchTab(btn.dataset.tab);
+});
+window.addEventListener('hashchange', () => {
+  const tab = location.hash.slice(1);
+  if (tab) switchTab(tab);
+});
+// Restore from URL hash on load
+if (location.hash) {
+  const initial = location.hash.slice(1);
+  if (document.getElementById('tab-content-' + initial)) switchTab(initial);
 }
 
 // Model status polling
@@ -476,9 +517,9 @@ refreshJobs();
 async function loadTokens() {
   try {
     const r = await fetch('/tokens');
-    if (!r.ok) return; // not a browser session — hide section
+    if (!r.ok) return; // not a browser session — tab stays hidden
     const tokens = await r.json();
-    document.getElementById('tokens-card').style.display = '';
+    document.getElementById('tab-tokens').style.display = '';
     renderTokens(tokens);
   } catch(e) {}
 }
@@ -555,7 +596,7 @@ async function loadModels() {
     });
     const probe = await fetch('/tokens');
     if (probe.ok) {
-      document.getElementById('models-card').style.display = '';
+      document.getElementById('tab-models').style.display = '';
       renderModelsList(data);
     }
   } catch(e) {}
