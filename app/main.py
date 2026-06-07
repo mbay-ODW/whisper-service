@@ -16,6 +16,9 @@ from werkzeug.utils import secure_filename
 app = Flask(__name__, template_folder="../templates")
 
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "")
+TRUST_PROXY_AUTH = os.environ.get("TRUST_PROXY_AUTH", "true").lower() == "true"
+OIDC_ISSUER = os.environ.get("OIDC_ISSUER", "")
+OIDC_CLIENT_ID = os.environ.get("OIDC_CLIENT_ID", "whisper-ios")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
 TRANSCRIPTS_DIR = Path("/transcripts")
 MODEL_CACHE_DIR = Path("/model_cache")
@@ -40,16 +43,23 @@ DEFAULT_PROMPT = (
 
 
 def check_auth(req):
-    if not AUTH_TOKEN:
-        return True
-    token = req.headers.get("Authorization", "")
-    if token.startswith("Bearer "):
-        token = token[7:]
-    if token == AUTH_TOKEN:
-        return True
-    # Also check query param for UI convenience
-    if req.args.get("token") == AUTH_TOKEN:
-        return True
+    # 1. Traefik + Authelia setzen Remote-User (und X-Forwarded-User) wenn
+    #    der Request authentifiziert wurde – sowohl für Browser-Sessions als
+    #    auch für Bearer-Token-Anfragen der iOS-App.
+    if TRUST_PROXY_AUTH:
+        if req.headers.get("Remote-User") or req.headers.get("X-Forwarded-User"):
+            return True
+
+    # 2. Direkter Bearer-Token (Entwicklung / lokaler Zugriff ohne Traefik)
+    if AUTH_TOKEN:
+        token = req.headers.get("Authorization", "")
+        if token.startswith("Bearer "):
+            token = token[7:]
+        if token == AUTH_TOKEN:
+            return True
+        if req.args.get("token") == AUTH_TOKEN:
+            return True
+
     return False
 
 
@@ -277,7 +287,8 @@ for _ in range(NUM_WORKERS):
 
 @app.before_request
 def require_auth():
-    if request.path in ("/health",):
+    # Öffentliche Endpunkte: Health-Check und OIDC-Config (für iOS-App-Setup)
+    if request.path in ("/health", "/api/config"):
         return
     if not check_auth(request):
         abort(401)
@@ -286,6 +297,17 @@ def require_auth():
 @app.route("/")
 def index():
     return render_template("index.html", default_prompt=DEFAULT_PROMPT, current_model=WHISPER_MODEL)
+
+
+@app.route("/api/config")
+def api_config():
+    """Liefert OIDC-Konfiguration für die iOS-App (kein Auth nötig)."""
+    return jsonify({
+        "oidc_issuer": OIDC_ISSUER,
+        "oidc_client_id": OIDC_CLIENT_ID,
+        "model_default": WHISPER_MODEL,
+        "models": ["large-v3", "medium", "small", "base"],
+    })
 
 
 @app.route("/health")

@@ -1,0 +1,28 @@
+# In deine Authelia-Konfiguration einfügen (configuration.yml):
+# identity_providers.oidc.clients[]
+#
+# Für Public-Client (iOS-App ohne Client-Secret, nur PKCE):
+
+identity_providers:
+  oidc:
+    clients:
+      - client_id: 'whisper-ios'
+        client_name: 'Whisper Memo iOS'
+        # Public Client = kein Secret nötig, PKCE pflicht
+        public: true
+        authorization_policy: 'one_factor'
+        redirect_uris:
+          - 'whispermemo://oauth/callback'
+        scopes:
+          - 'openid'
+          - 'profile'
+          - 'email'
+        grant_types:
+          - 'authorization_code'
+        response_types:
+          - 'code'
+        pkce_challenge_method: 'S256'
+        # Refresh-Token-Rotation aktivieren
+        token_endpoint_auth_method: 'none'
+        access_token_lifespan: '1h'
+        refresh_token_lifespan: '90d'
