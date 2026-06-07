@@ -358,6 +358,7 @@ function renderJobs(jobs) {
       if (canCancel) actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="cancelJob('${job.id}')">Abbrechen</button>`;
       if (canRetry)  actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="retryJob('${job.id}')">Wiederholen</button>`;
       if (isDone) {
+        actionsHtml += `<button class="btn btn-primary btn-sm" onclick="shareText('${job.id}')">Teilen</button>`;
         actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="copyText('${job.id}')">Kopieren</button>`;
         actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="downloadFmt('${job.id}','txt')">TXT</button>`;
         actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="downloadFmt('${job.id}','srt')">SRT</button>`;
@@ -478,6 +479,32 @@ async function copyText(id) {
     showToast('Text kopiert');
   } catch(e) {
     showToast('Kopieren fehlgeschlagen', true);
+  }
+}
+
+async function shareText(id) {
+  const job = knownJobs[id]?.data;
+  if (!job) return;
+  const title = `Transkript: ${job.filename}`;
+  const text = job.full_text;
+  // Native Share Sheet (iOS/Android/Edge) — WhatsApp, Mail, Messages etc.
+  if (navigator.share) {
+    try {
+      await navigator.share({title, text});
+      return;
+    } catch(e) {
+      if (e.name === 'AbortError') return; // user cancelled
+    }
+  }
+  // Desktop fallback: WhatsApp Web in a new tab
+  if (confirm('Native Sharing nicht verfügbar. In WhatsApp Web öffnen?')) {
+    window.open('https://wa.me/?text=' + encodeURIComponent(text), '_blank');
+  } else {
+    // Last resort: copy to clipboard
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast('Text in Zwischenablage kopiert');
+    } catch(e) { showToast('Fehler beim Teilen', true); }
   }
 }
 
