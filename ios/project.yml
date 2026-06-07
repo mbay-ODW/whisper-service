@@ -4,16 +4,18 @@ options:
   deploymentTarget:
     iOS: "18.0"
   xcodeVersion: "16"
+  # Don't regenerate Info.plist — file is hand-managed (background modes etc.)
+  generateEmptyDirectories: false
 
 settings:
   base:
     SWIFT_VERSION: 5.9
-    DEVELOPMENT_TEAM: ""
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
     # Xcode "Update to recommended settings" — baked in so xcodegen keeps them
     ENABLE_USER_SCRIPT_SANDBOXING: "YES"
     LOCALIZATION_PREFERS_STRING_CATALOGS: "YES"
+    LOCALIZED_STRING_SWIFTUI_SUPPORT: "YES"
 
 targets:
   WhisperMemo:
@@ -24,20 +26,6 @@ targets:
       - path: WhisperMemo
         excludes:
           - "Info.plist"
-    info:
-      path: WhisperMemo/Info.plist
-      properties:
-        CFBundleDisplayName: WhisperMemo
-        CFBundleIdentifier: de.bay-ram.WhisperMemo
-        CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "1"
-        UILaunchScreen:
-          UIColorName: ""
-        UISupportedInterfaceOrientations:
-          - UIInterfaceOrientationPortrait
-        NSMicrophoneUsageDescription: "WhisperMemo benötigt das Mikrofon, um deine Sprachmemos aufzunehmen."
-        UIBackgroundModes:
-          - audio
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: de.bay-ram.WhisperMemo
