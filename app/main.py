@@ -25,9 +25,14 @@ WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
 TRANSCRIPTS_DIR = Path("/transcripts")
 MODEL_CACHE_DIR = Path("/model_cache")
 TOKENS_FILE = TRANSCRIPTS_DIR / ".tokens.json"
+MODELS_FILE = TRANSCRIPTS_DIR / ".models.json"
 TRANSCRIPTS_DIR.mkdir(exist_ok=True)
 
+# Built-in models always available (downloaded by faster-whisper on demand)
+BUILTIN_MODELS = ["large-v3", "medium", "small", "base"]
+
 _tokens_lock = threading.Lock()
+_models_lock = threading.Lock()
 
 
 def _load_tokens() -> dict:
@@ -39,6 +44,30 @@ def _load_tokens() -> dict:
 
 def _save_tokens(tokens: dict):
     TOKENS_FILE.write_text(json.dumps(tokens, indent=2))
+
+
+def _load_custom_models() -> list:
+    try:
+        return json.loads(MODELS_FILE.read_text())
+    except Exception:
+        return []
+
+
+def _save_custom_models(models: list):
+    MODELS_FILE.write_text(json.dumps(models, indent=2))
+
+
+def _all_models() -> list:
+    with _models_lock:
+        custom = _load_custom_models()
+    # preserve order, skip duplicates
+    seen = set()
+    out = []
+    for m in BUILTIN_MODELS + custom:
+        if m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
 
 ALLOWED_EXTENSIONS = {"m4a", "mp3", "wav", "ogg", "flac", "webm", "mp4"}
 
@@ -335,8 +364,53 @@ def index():
 def api_config():
     return jsonify({
         "model_default": WHISPER_MODEL,
-        "models": ["large-v3", "medium", "small", "base"],
+        "models": _all_models(),
     })
+
+
+@app.route("/api/models")
+def list_models():
+    with _models_lock:
+        custom = _load_custom_models()
+    return jsonify({
+        "builtin": BUILTIN_MODELS,
+        "custom": custom,
+        "default": WHISPER_MODEL,
+    })
+
+
+@app.route("/api/models/add", methods=["POST"])
+def add_model():
+    if not is_browser_auth(request):
+        abort(403)
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Modellname erforderlich"}), 400
+    if len(name) > 200 or any(c in name for c in [" ", "\n", "\t", "..", "\\"]):
+        return jsonify({"error": "Ungültiger Modellname"}), 400
+    with _models_lock:
+        custom = _load_custom_models()
+        if name in BUILTIN_MODELS or name in custom:
+            return jsonify({"error": "Modell bereits vorhanden"}), 409
+        custom.append(name)
+        _save_custom_models(custom)
+    return jsonify({"ok": True, "name": name}), 201
+
+
+@app.route("/api/models/<path:name>/delete", methods=["POST"])
+def delete_model(name):
+    if not is_browser_auth(request):
+        abort(403)
+    if name in BUILTIN_MODELS:
+        return jsonify({"error": "Built-in-Modelle können nicht entfernt werden"}), 400
+    with _models_lock:
+        custom = _load_custom_models()
+        if name not in custom:
+            return jsonify({"error": "Not found"}), 404
+        custom.remove(name)
+        _save_custom_models(custom)
+    return jsonify({"ok": True})
 
 
 @app.route("/tokens", methods=["GET"])

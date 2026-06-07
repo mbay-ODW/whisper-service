@@ -115,12 +115,7 @@ select{min-width:140px}
   <div class="settings-row">
     <div>
       <label for="model-select">Modell</label>
-      <select id="model-select">
-        <option value="large-v3" {% if current_model == 'large-v3' %}selected{% endif %}>large-v3 (beste Qualität)</option>
-        <option value="medium" {% if current_model == 'medium' %}selected{% endif %}>medium</option>
-        <option value="small" {% if current_model == 'small' %}selected{% endif %}>small (schnell)</option>
-        <option value="base" {% if current_model == 'base' %}selected{% endif %}>base (sehr schnell)</option>
-      </select>
+      <select id="model-select"></select>
     </div>
   </div>
   <label style="font-size:.8rem;color:#94a3b8;display:block;margin-bottom:4px">Initial Prompt (Fachvokabular)</label>
@@ -142,6 +137,18 @@ select{min-width:140px}
 <div class="card">
   <div class="card-title">Aufträge</div>
   <div id="jobs-container"><div class="empty-state">Noch keine Aufträge</div></div>
+</div>
+
+<div class="card" id="models-card" style="display:none">
+  <div class="card-title">Modelle</div>
+  <div id="models-list"></div>
+  <div class="token-create-row">
+    <input type="text" id="model-name-input" placeholder="HuggingFace-Name (z.B. Systran/faster-whisper-distil-large-v3)">
+    <button class="btn btn-primary" onclick="addModel()">Hinzufügen</button>
+  </div>
+  <div style="font-size:.7rem;color:#64748b;margin-top:8px">
+    Beim ersten Verwenden wird das Modell automatisch heruntergeladen. CTranslate2-kompatible faster-whisper-Modelle.
+  </div>
 </div>
 
 <div class="card" id="tokens-card" style="display:none">
@@ -523,6 +530,82 @@ async function copyToken(value) {
 }
 
 loadTokens();
+
+// ── Models ──────────────────────────────────────────────────────────────
+async function loadModels() {
+  try {
+    const r = await apiFetch('/api/models');
+    if (!r.ok) return;
+    const data = await r.json();
+    const sel = document.getElementById('model-select');
+    const current = sel.value || data.default;
+    sel.innerHTML = '';
+    const labels = {
+      'large-v3': 'large-v3 (beste Qualität)',
+      'medium': 'medium',
+      'small': 'small (schnell)',
+      'base': 'base (sehr schnell)',
+    };
+    [...data.builtin, ...data.custom].forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m;
+      opt.textContent = labels[m] || m;
+      if (m === current) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    const probe = await fetch('/tokens');
+    if (probe.ok) {
+      document.getElementById('models-card').style.display = '';
+      renderModelsList(data);
+    }
+  } catch(e) {}
+}
+
+function renderModelsList(data) {
+  const list = document.getElementById('models-list');
+  const rows = [];
+  data.builtin.forEach(m => {
+    rows.push(`
+      <div class="token-row">
+        <span class="token-name">${escHtml(m)}</span>
+        <span class="token-value" style="cursor:default;color:#64748b">built-in</span>
+      </div>`);
+  });
+  data.custom.forEach(m => {
+    const safe = escHtml(m).replace(/'/g, "\\'");
+    rows.push(`
+      <div class="token-row">
+        <span class="token-name">${escHtml(m)}</span>
+        <button class="btn btn-danger btn-sm" onclick="deleteModel('${safe}')">Entfernen</button>
+      </div>`);
+  });
+  list.innerHTML = rows.join('');
+}
+
+async function addModel() {
+  const input = document.getElementById('model-name-input');
+  const name = input.value.trim();
+  if (!name) return;
+  const r = await fetch('/api/models/add', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name})
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { showToast('Fehler: ' + (d.error || r.status), true); return; }
+  input.value = '';
+  showToast('Modell hinzugefügt');
+  await loadModels();
+}
+
+async function deleteModel(name) {
+  if (!confirm(`Modell "${name}" entfernen?`)) return;
+  const r = await fetch(`/api/models/${encodeURIComponent(name)}/delete`, {method:'POST'});
+  if (r.ok) { showToast('Modell entfernt'); await loadModels(); }
+  else { const d = await r.json().catch(() => ({})); showToast('Fehler: ' + (d.error || r.status), true); }
+}
+
+loadModels();
 </script>
 </body>
 </html>
