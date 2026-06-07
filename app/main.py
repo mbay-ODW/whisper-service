@@ -15,7 +15,7 @@ from flask import Flask, request, jsonify, render_template, abort, send_file, Re
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__, template_folder="../templates")
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
+app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
 app.config["SESSION_COOKIE_SECURE"] = True
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Strict"
