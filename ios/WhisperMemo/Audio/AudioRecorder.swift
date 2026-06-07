@@ -55,11 +55,16 @@ final class AudioRecorder: NSObject, ObservableObject {
         }
 
         let session = AVAudioSession.sharedInstance()
-        // .allowBluetooth = HFP input from AirPods/BT-Headsets as recording source
-        // .allowBluetoothA2DP = high-quality playback to BT speakers/headphones
-        // .defaultToSpeaker = fall back to speaker when nothing else is connected
-        try session.setCategory(.playAndRecord, mode: .default,
-                                options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
+        // HFP input = AirPods/BT-Headsets as recording source
+        // A2DP    = high-quality playback to BT speakers/headphones
+        // defaultToSpeaker = fall back to speaker when nothing else is connected
+        var options: AVAudioSession.CategoryOptions = [.defaultToSpeaker, .allowBluetoothA2DP]
+        if #available(iOS 18.0, *) {
+            options.insert(.allowBluetoothHFP)
+        } else {
+            options.insert(.allowBluetooth)
+        }
+        try session.setCategory(.playAndRecord, mode: .default, options: options)
         try session.setActive(true)
         updateInputInfo()
 
