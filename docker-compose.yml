@@ -1,0 +1,25 @@
+services:
+  whisper:
+    build: .
+    container_name: whisper-service
+    restart: unless-stopped
+    ports:
+      - "5050:5000"
+    environment:
+      - WHISPER_MODEL=${WHISPER_MODEL:-large-v3}
+      - AUTH_TOKEN=${AUTH_TOKEN:-changeme}
+    volumes:
+      - whisper_models:/model_cache
+      - whisper_transcripts:/transcripts
+    # GPU support – comment out the 'deploy' block if no NVIDIA GPU available
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+volumes:
+  whisper_models:
+  whisper_transcripts:

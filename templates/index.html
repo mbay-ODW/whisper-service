@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Whisper Transkription</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh;padding:24px}
+h1{font-size:1.5rem;font-weight:700;margin-bottom:4px;color:#f8fafc}
+.subtitle{color:#64748b;font-size:.875rem;margin-bottom:24px}
+.card{background:#1e2432;border:1px solid #2d3748;border-radius:12px;padding:20px;margin-bottom:16px}
+.card-title{font-size:.8rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b;margin-bottom:12px}
+
+/* Model status */
+#model-status{display:flex;align-items:center;gap:8px;font-size:.8rem;margin-bottom:16px}
+.dot{width:8px;height:8px;border-radius:50%;background:#f59e0b;animation:pulse 1.5s infinite}
+.dot.ready{background:#10b981;animation:none}
+.dot.error{background:#ef4444;animation:none}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+/* Settings row */
+.settings-row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+.settings-row label{font-size:.8rem;color:#94a3b8;display:block;margin-bottom:4px}
+select,input[type=text]{background:#0f1117;border:1px solid #2d3748;color:#e2e8f0;border-radius:6px;padding:6px 10px;font-size:.875rem;outline:none}
+select:focus,input[type=text]:focus{border-color:#6366f1}
+select{min-width:140px}
+
+/* Drop zone */
+#dropzone{border:2px dashed #2d3748;border-radius:10px;padding:40px 20px;text-align:center;cursor:pointer;transition:all .2s;position:relative}
+#dropzone.drag-over{border-color:#6366f1;background:#1a1f35}
+#dropzone svg{opacity:.4;margin-bottom:12px}
+#dropzone p{color:#64748b;font-size:.9rem}
+#dropzone p strong{color:#94a3b8}
+#file-input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%}
+
+/* Prompt */
+#prompt-input{width:100%;background:#0f1117;border:1px solid #2d3748;color:#e2e8f0;border-radius:6px;padding:8px 10px;font-size:.8rem;font-family:inherit;resize:vertical;min-height:64px;outline:none}
+#prompt-input:focus{border-color:#6366f1}
+
+/* Jobs */
+.job{border:1px solid #2d3748;border-radius:8px;padding:14px;margin-bottom:10px;background:#161b27}
+.job-header{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:8px}
+.job-name{font-size:.875rem;font-weight:500;word-break:break-all}
+.job-meta{font-size:.75rem;color:#64748b}
+.badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:.7rem;font-weight:600;text-transform:uppercase}
+.badge.queued{background:#1e3a5f;color:#60a5fa}
+.badge.processing{background:#2d1f5e;color:#a78bfa}
+.badge.done{background:#14432a;color:#34d399}
+.badge.error{background:#3b1111;color:#f87171}
+.badge.cancelled{background:#1f2937;color:#6b7280}
+.badge.cancelling{background:#1f2937;color:#9ca3af}
+
+/* Progress bar */
+.progress-bar{height:4px;background:#2d3748;border-radius:2px;margin:8px 0;overflow:hidden}
+.progress-fill{height:100%;background:linear-gradient(90deg,#6366f1,#8b5cf6);transition:width .3s;border-radius:2px}
+
+/* Transcript */
+.transcript{background:#0f1117;border:1px solid #1e2432;border-radius:6px;padding:12px;margin-top:10px;font-size:.8rem;line-height:1.6;white-space:pre-wrap;max-height:260px;overflow-y:auto;color:#cbd5e1}
+.segments-toggle{font-size:.75rem;color:#6366f1;cursor:pointer;background:none;border:none;padding:0;margin-top:6px}
+.segments-toggle:hover{color:#818cf8}
+.segments{margin-top:8px;display:none}
+.segment{display:flex;gap:8px;padding:4px 0;border-bottom:1px solid #1e2432;font-size:.75rem}
+.seg-time{color:#64748b;min-width:100px;flex-shrink:0;font-variant-numeric:tabular-nums}
+.seg-text{color:#cbd5e1}
+
+/* Action buttons */
+.actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.btn{padding:5px 12px;border-radius:6px;font-size:.75rem;font-weight:500;cursor:pointer;border:none;transition:all .15s}
+.btn-ghost{background:#1e2432;color:#94a3b8;border:1px solid #2d3748}
+.btn-ghost:hover{background:#2d3748;color:#e2e8f0}
+.btn-danger{background:#3b1111;color:#f87171;border:1px solid #7f1d1d}
+.btn-danger:hover{background:#7f1d1d;color:#fca5a5}
+.btn-primary{background:#4f46e5;color:#fff;border:none}
+.btn-primary:hover{background:#6366f1}
+.btn-sm{padding:3px 8px;font-size:.7rem}
+
+/* Upload btn */
+#upload-btn{width:100%;padding:10px;background:#4f46e5;color:#fff;border:none;border-radius:8px;font-size:.9rem;font-weight:600;cursor:pointer;margin-top:12px;transition:background .2s}
+#upload-btn:hover{background:#6366f1}
+#upload-btn:disabled{background:#2d3748;color:#64748b;cursor:not-allowed}
+
+.empty-state{text-align:center;padding:32px;color:#475569;font-size:.875rem}
+
+/* Toast */
+#toast{position:fixed;bottom:24px;right:24px;background:#1e2432;border:1px solid #2d3748;color:#e2e8f0;padding:10px 16px;border-radius:8px;font-size:.8rem;opacity:0;transition:opacity .3s;pointer-events:none;z-index:999}
+#toast.show{opacity:1}
+</style>
+</head>
+<body>
+<h1>Whisper Transkription</h1>
+<p class="subtitle">Sprachmemos für Baustellenbegehungen</p>
+
+<div id="model-status">
+  <span class="dot" id="model-dot"></span>
+  <span id="model-label">Modell wird geladen…</span>
+</div>
+
+<div class="card">
+  <div class="card-title">Einstellungen</div>
+  <div class="settings-row">
+    <div>
+      <label for="model-select">Modell</label>
+      <select id="model-select">
+        <option value="large-v3" {% if current_model == 'large-v3' %}selected{% endif %}>large-v3 (beste Qualität)</option>
+        <option value="medium" {% if current_model == 'medium' %}selected{% endif %}>medium</option>
+        <option value="small" {% if current_model == 'small' %}selected{% endif %}>small (schnell)</option>
+        <option value="base" {% if current_model == 'base' %}selected{% endif %}>base (sehr schnell)</option>
+      </select>
+    </div>
+  </div>
+  <label style="font-size:.8rem;color:#94a3b8;display:block;margin-bottom:4px">Initial Prompt (Fachvokabular)</label>
+  <textarea id="prompt-input">{{ default_prompt }}</textarea>
+</div>
+
+<div class="card">
+  <div class="card-title">Dateien hochladen</div>
+  <div id="dropzone">
+    <input type="file" id="file-input" multiple accept=".m4a,.mp3,.wav,.ogg,.flac,.webm,.mp4">
+    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+    <p><strong>Dateien hierher ziehen</strong> oder klicken</p>
+    <p style="font-size:.75rem;margin-top:4px">m4a, mp3, wav, ogg, flac, webm</p>
+  </div>
+  <div id="file-list" style="margin-top:10px;font-size:.8rem;color:#64748b"></div>
+  <button id="upload-btn" disabled>Hochladen & Transkribieren</button>
+</div>
+
+<div class="card">
+  <div class="card-title">Aufträge</div>
+  <div id="jobs-container"><div class="empty-state">Noch keine Aufträge</div></div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+const authHeader = TOKEN ? {'Authorization': 'Bearer ' + TOKEN} : {};
+
+function apiFetch(url, opts = {}) {
+  opts.headers = Object.assign({}, authHeader, opts.headers || {});
+  return fetch(url, opts);
+}
+
+// Model status polling
+async function checkModelStatus() {
+  try {
+    const r = await apiFetch('/api/model-status');
+    const d = await r.json();
+    const dot = document.getElementById('model-dot');
+    const label = document.getElementById('model-label');
+    if (d.ready) {
+      dot.className = 'dot ready';
+      label.textContent = `Modell ${d.model} bereit`;
+    } else if (d.error) {
+      dot.className = 'dot error';
+      label.textContent = `Fehler: ${d.error}`;
+    } else {
+      dot.className = 'dot';
+      label.textContent = `Modell ${d.model} wird geladen…`;
+      setTimeout(checkModelStatus, 3000);
+    }
+  } catch(e) {
+    setTimeout(checkModelStatus, 5000);
+  }
+}
+checkModelStatus();
+
+// File input
+let selectedFiles = [];
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('file-input');
+const fileList = document.getElementById('file-list');
+const uploadBtn = document.getElementById('upload-btn');
+
+function updateFileList() {
+  uploadBtn.disabled = selectedFiles.length === 0;
+  if (selectedFiles.length === 0) { fileList.textContent = ''; return; }
+  fileList.textContent = `${selectedFiles.length} Datei(en): ${selectedFiles.map(f=>f.name).join(', ')}`;
+}
+
+fileInput.addEventListener('change', () => {
+  selectedFiles = Array.from(fileInput.files);
+  updateFileList();
+});
+
+dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag-over'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag-over'));
+dropzone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropzone.classList.remove('drag-over');
+  selectedFiles = Array.from(e.dataTransfer.files);
+  updateFileList();
+});
+
+uploadBtn.addEventListener('click', async () => {
+  if (!selectedFiles.length) return;
+  const fd = new FormData();
+  selectedFiles.forEach(f => fd.append('files', f));
+  fd.append('initial_prompt', document.getElementById('prompt-input').value);
+  fd.append('model', document.getElementById('model-select').value);
+
+  uploadBtn.disabled = true;
+  uploadBtn.textContent = 'Wird hochgeladen…';
+
+  try {
+    const r = await apiFetch('/api/upload', { method: 'POST', body: fd });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Upload fehlgeschlagen');
+    showToast(`${d.jobs.length} Auftrag/Aufträge erstellt`);
+    selectedFiles = [];
+    fileInput.value = '';
+    updateFileList();
+    refreshJobs();
+  } catch(e) {
+    showToast('Fehler: ' + e.message, true);
+  } finally {
+    uploadBtn.textContent = 'Hochladen & Transkribieren';
+    updateFileList();
+  }
+});
+
+// Jobs
+let knownJobs = {};
+
+async function refreshJobs() {
+  try {
+    const r = await apiFetch('/api/jobs');
+    const jobs = await r.json();
+    renderJobs(jobs);
+
+    const active = jobs.filter(j => ['queued','processing','cancelling'].includes(j.status));
+    if (active.length > 0) setTimeout(refreshJobs, 1500);
+    else setTimeout(refreshJobs, 5000);
+  } catch(e) {
+    setTimeout(refreshJobs, 5000);
+  }
+}
+
+function renderJobs(jobs) {
+  const container = document.getElementById('jobs-container');
+  if (!jobs.length) {
+    container.innerHTML = '<div class="empty-state">Noch keine Aufträge</div>';
+    return;
+  }
+
+  // Keep expanded segments state
+  const expanded = {};
+  container.querySelectorAll('.segments').forEach(el => {
+    if (el.style.display !== 'none') expanded[el.dataset.jobId] = true;
+  });
+
+  container.innerHTML = '';
+  jobs.forEach(job => {
+    const div = document.createElement('div');
+    div.className = 'job';
+    div.dataset.jobId = job.id;
+
+    const canCancel = ['queued','processing'].includes(job.status);
+    const canDelete = ['done','error','cancelled'].includes(job.status);
+    const isDone = job.status === 'done';
+
+    let actionsHtml = '';
+    if (canCancel) actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="cancelJob('${job.id}')">Abbrechen</button>`;
+    if (isDone) {
+      actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="copyText('${job.id}')">Kopieren</button>`;
+      actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="downloadFmt('${job.id}','txt')">TXT</button>`;
+      actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="downloadFmt('${job.id}','srt')">SRT</button>`;
+      actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="downloadFmt('${job.id}','json')">JSON</button>`;
+    }
+    if (canDelete) actionsHtml += `<button class="btn btn-danger btn-sm" onclick="deleteJob('${job.id}')">Löschen</button>`;
+
+    let progressHtml = '';
+    if (['queued','processing','cancelling'].includes(job.status)) {
+      progressHtml = `<div class="progress-bar"><div class="progress-fill" style="width:${job.progress}%"></div></div>`;
+    }
+
+    let durationHtml = job.duration ? ` · ${job.duration}s` : '';
+    let modelHtml = job.model ? ` · ${job.model}` : '';
+
+    div.innerHTML = `
+      <div class="job-header">
+        <div>
+          <div class="job-name">${escHtml(job.filename)}</div>
+          <div class="job-meta">${new Date(job.created_at*1000).toLocaleTimeString('de-DE')}${durationHtml}${modelHtml}</div>
+        </div>
+        <span class="badge ${job.status}">${statusLabel(job.status)}</span>
+      </div>
+      ${progressHtml}
+      ${job.error ? `<div style="color:#f87171;font-size:.75rem;margin-top:4px">${escHtml(job.error)}</div>` : ''}
+      <div class="actions">${actionsHtml}</div>
+    `;
+
+    // Fetch and render transcript if done
+    if (isDone) {
+      knownJobs[job.id] = knownJobs[job.id] || {};
+      if (!knownJobs[job.id].loaded) {
+        knownJobs[job.id].loaded = true;
+        loadJobDetail(job.id, div, expanded[job.id]);
+      } else {
+        appendTranscript(div, knownJobs[job.id].data, expanded[job.id]);
+      }
+    }
+
+    container.appendChild(div);
+  });
+}
+
+async function loadJobDetail(jobId, container, isExpanded) {
+  try {
+    const r = await apiFetch(`/api/jobs/${jobId}`);
+    const job = await r.json();
+    knownJobs[jobId].data = job;
+    appendTranscript(container, job, isExpanded);
+  } catch(e) {}
+}
+
+function appendTranscript(container, job, isExpanded) {
+  if (!job || !job.full_text) return;
+
+  const transcriptDiv = document.createElement('div');
+  transcriptDiv.className = 'transcript';
+  transcriptDiv.textContent = job.full_text;
+  container.appendChild(transcriptDiv);
+
+  if (job.segments && job.segments.length > 0) {
+    const toggle = document.createElement('button');
+    toggle.className = 'segments-toggle';
+    toggle.textContent = 'Zeitstempel anzeigen';
+    container.appendChild(toggle);
+
+    const segDiv = document.createElement('div');
+    segDiv.className = 'segments';
+    segDiv.dataset.jobId = job.id;
+    if (isExpanded) { segDiv.style.display = 'block'; toggle.textContent = 'Zeitstempel verbergen'; }
+
+    job.segments.forEach(seg => {
+      const row = document.createElement('div');
+      row.className = 'segment';
+      row.innerHTML = `<span class="seg-time">${fmtTime(seg.start)} → ${fmtTime(seg.end)}</span><span class="seg-text">${escHtml(seg.text)}</span>`;
+      segDiv.appendChild(row);
+    });
+    container.appendChild(segDiv);
+
+    toggle.addEventListener('click', () => {
+      const show = segDiv.style.display === 'none' || segDiv.style.display === '';
+      segDiv.style.display = show ? 'block' : 'none';
+      toggle.textContent = show ? 'Zeitstempel verbergen' : 'Zeitstempel anzeigen';
+    });
+  }
+}
+
+async function cancelJob(id) {
+  await apiFetch(`/api/jobs/${id}/cancel`, {method:'POST'});
+  refreshJobs();
+}
+
+async function deleteJob(id) {
+  await apiFetch(`/api/jobs/${id}/delete`, {method:'DELETE'});
+  delete knownJobs[id];
+  refreshJobs();
+}
+
+async function copyText(id) {
+  const job = knownJobs[id]?.data;
+  if (!job) return;
+  try {
+    await navigator.clipboard.writeText(job.full_text);
+    showToast('Text kopiert');
+  } catch(e) {
+    showToast('Kopieren fehlgeschlagen', true);
+  }
+}
+
+function downloadFmt(id, fmt) {
+  const sep = location.search ? '&' : '?';
+  const tokenParam = TOKEN ? `${sep}token=${TOKEN}` : '';
+  location.href = `/api/download/${id}/${fmt}${location.search}${TOKEN && !location.search ? '?token='+TOKEN : (TOKEN ? '&token='+TOKEN : '')}`;
+}
+
+function statusLabel(s) {
+  return {queued:'Warteschlange',processing:'Läuft',done:'Fertig',error:'Fehler',cancelled:'Abgebrochen',cancelling:'Wird abgebrochen…'}[s] || s;
+}
+
+function fmtTime(s) {
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = Math.floor(s%60);
+  if (h) return `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+  return `${m}:${String(sec).padStart(2,'0')}`;
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+let toastTimer;
+function showToast(msg, isError = false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.borderColor = isError ? '#7f1d1d' : '#2d3748';
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+refreshJobs();
+</script>
+</body>
+</html>
