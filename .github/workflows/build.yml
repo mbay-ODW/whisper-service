@@ -3,6 +3,9 @@ name: Build and push image
 on:
   push:
     branches: [main]
+    paths:
+      - 'server/**'
+      - '.github/workflows/build.yml'
   workflow_dispatch:
 
 jobs:
@@ -28,7 +31,7 @@ jobs:
 
       - uses: docker/build-push-action@v5
         with:
-          context: .
+          context: ./server
           push: true
           tags: |
             ghcr.io/${{ steps.repo.outputs.name }}:latest

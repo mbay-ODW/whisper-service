@@ -1,220 +1,297 @@
-# Whisper Transkriptionsdienst
+# Whisper Service
 
-Selbst gehosteter Audio-Transkriptionsdienst für Baustellenbegehungen. Sprache rein, deutscher Text raus — mit Fachvokabular für Elektroinstallation und Holzständerbau.
+> Selbst gehostete Sprache-zu-Text-Pipeline für die Baustelle — Server, Web-UI und native iOS-App in einem Repo.
 
-Basiert auf [faster-whisper](https://github.com/guillaumekleindienst/faster-whisper) (large-v3), läuft auf CPU oder NVIDIA-GPU, geschützt über Authelia OIDC.
+Nimm Memos auf der Baustelle auf, lass sie automatisch per [faster-whisper](https://github.com/SYSTRAN/faster-whisper) transkribieren, durchsuche und teile die Ergebnisse. Datenhoheit bleibt zu Hause — auf deinem Server.
+
+---
+
+## Was drin ist
+
+| Teil | Stack | Pfad |
+|---|---|---|
+| **Server** | Python · Flask · faster-whisper · Docker · GHCR | [`server/`](./server) |
+| **iOS-App** | SwiftUI · iOS 17+ · xcodegen | [`ios/`](./ios) |
+| **CI** | GitHub Actions baut Image bei jedem Push auf `main` | [`.github/workflows/build.yml`](./.github/workflows/build.yml) |
+| **Deploy-Compose** | Stack zieht das fertige Image | [`docker-compose.yml`](./docker-compose.yml) |
 
 ---
 
 ## Features
 
-- **Drag & Drop Upload** — m4a, mp3, wav, ogg, flac, webm; mehrere Dateien gleichzeitig
-- **Warteschlange mit Live-Fortschritt** — pro Datei, Echtzeit-Polling
-- **Modellauswahl in der UI** — large-v3, medium, small, base
-- **Editierbarer Initial-Prompt** — vorbelegt mit Fachvokabular für Zahlen und Fachbegriffe
-- **Segmente mit Zeitstempeln** — aufklappbar, direkt in der UI
-- **Export** — TXT, SRT, JSON; Transkripte serverseitig in einem Volume gespeichert
-- **REST-API** — für automatisierte Aufrufe und die iOS-App
-- **OIDC-Auth via Authelia** — Bearer Token (iOS) + Cookie-Session (Browser)
+### Server / Web-UI
+
+- 🎙 **Multi-Format-Upload** — m4a, mp3, wav, ogg, flac, webm, mp4
+- ⚡ **GPU oder CPU** — faster-whisper erkennt CUDA automatisch, fällt sonst auf int8-CPU zurück
+- 📋 **Modell-Verwaltung im UI** — `large-v3`, `medium`, `small`, `base` plus beliebige HuggingFace-CT2-Modelle
+- 🗂 **Jobs nach Datum gruppiert** — Heute / Gestern / Datum
+- 🔁 **Retry & Cancel** für fehlgeschlagene Jobs
+- 🔐 **Hybrid-Auth** — Browser via [Authelia](https://www.authelia.com/) Forward-Auth, iOS/API via statischem App-Token
+- 🔑 **Token-Management im UI** — Tokens erstellen/widerrufen per Klick
+- 📤 **Native Share-API** — Transkript per WhatsApp/Mail/Messages teilen
+- 💾 **Persistente Volumes** — Modelle und Transkripte überleben Container-Restarts
+
+### iOS-App (WhisperMemo)
+
+- 🎤 **One-Tap-Aufnahme** mit Waveform-Visualisierung
+- 🎧 **AirPods / Bluetooth-Headset** als Mikrofon (HFP)
+- 📶 **Offline-Queue** — Aufnahmen werden lokal gespeichert und automatisch hochgeladen, sobald der Server erreichbar ist
+- 🩺 **Echte Reachability** — Server-`/health` wird alle 30 s geprobet (nicht nur NWPathMonitor)
+- 📊 **Statistik & Speicher** — lokaler Footprint, Queue-Größe, verwaiste Aufnahmen aufräumen
+- 🗣 **Initial Prompt** für Fachvokabular (Elektroinstallation, Holzständerbau, etc.)
+- 📤 **Teilen** über das native Share-Sheet (Swipe oder Toolbar)
 
 ---
 
-## Schnellstart
+## Architektur
 
-```bash
-git clone https://github.com/mbay-ODW/whisper-service.git
-cd whisper-service
-cp .env.example .env
-# .env anpassen (siehe ENV-Variablen unten)
-docker compose up -d --build
+```
+                       ┌────────────────────────┐
+   Browser ─ Authelia ─┤ whisper-ui  (Traefik) │ ── Cookie-Session
+   (forward-auth)      │                       │
+                       │ whisper-api (Traefik) │ ── Bearer-Token
+   iOS-App ────────────┤  (kein Authelia)      │
+   (Bearer)            │                       │
+   Public ─────────────┤ whisper-public        │ ── /health, /api/config
+                       └──────────┬─────────────┘
+                                  │
+                         ┌────────▼────────┐
+                         │  Flask-Service  │
+                         │  faster-whisper │
+                         │     ffmpeg      │
+                         └────┬───────┬────┘
+                              │       │
+                      /model_cache  /transcripts
+                      (Docker Volumes)
 ```
 
-Beim ersten Start lädt Docker das Whisper-Modell (~3 GB für large-v3). Fortschritt im Log:
+**Drei Traefik-Router teilen sich denselben Host** (`whisper.example.com`):
 
-```bash
-docker logs -f whisper-service
-# → Model large-v3 loaded successfully.
-```
+| Router | Pfad | Middleware | Zweck |
+|---|---|---|---|
+| `whisper-public` | `/health`, `/api/config` | — | Reachability-Probes, App-Setup |
+| `whisper-api` | `PathPrefix(/api)` | — | Flask validiert Bearer-Token selbst |
+| `whisper-ui` | alles andere | `authelia` Forward-Auth | Browser-Session via Cookie |
 
----
-
-## ENV-Variablen
-
-| Variable | Default | Beschreibung |
-|---|---|---|
-| `WHISPER_MODEL` | `large-v3` | Modell: `large-v3`, `medium`, `small`, `base` |
-| `AUTH_TOKEN` | *(leer)* | Bearer-Token für Direktzugriff ohne Traefik (Entwicklung) |
-| `TRUST_PROXY_AUTH` | `true` | Authelia `Remote-User`-Header vertrauen |
-| `OIDC_ISSUER` | *(leer)* | Authelia-URL, z. B. `https://auth.example.com` |
-| `OIDC_CLIENT_ID` | `whisper-ios` | Client-ID für die iOS-App |
-| `WHISPER_HOST` | `whisper.example.com` | Hostname für Traefik-Routing |
+Beim ersten Aufruf von `GET /` setzt Flask anhand des `Remote-User`-Headers eine signierte Session-Cookie. AJAX-Requests an `/api/*` (kein Authelia auf der Route!) authentifizieren sich dann via Cookie. iOS-Clients senden stattdessen `Authorization: Bearer <token>`.
 
 ---
 
-## Traefik + Authelia
+## Quickstart
 
-Der Dienst läuft hinter Traefik und wird durch Authelia geschützt. Der Container selbst braucht keine eigene Auth-Logik — Authelia setzt den `Remote-User`-Header, dem Flask vertraut.
+### Voraussetzungen
 
-### 1. Traefik-Labels (bereits in docker-compose.yml)
+- Docker-Host mit Traefik + Authelia (z.B. via [Portainer](https://www.portainer.io/) auf TrueNAS)
+- Externes Docker-Network `traefik`
+- (Optional) NVIDIA-GPU + nvidia-docker für schnelles `large-v3`
+
+### Stack starten
 
 ```yaml
-labels:
-  - "traefik.enable=true"
-  - "traefik.http.routers.whisper.rule=Host(`whisper.example.com`)"
-  - "traefik.http.routers.whisper.entrypoints=websecure"
-  - "traefik.http.routers.whisper.tls=true"
-  - "traefik.http.routers.whisper.middlewares=authelia@docker"
-  - "traefik.http.services.whisper.loadbalancer.server.port=5000"
-```
+# docker-compose.yml — Image kommt direkt von ghcr.io
+services:
+  whisper:
+    image: ghcr.io/mbay-odw/whisper-service:latest
+    container_name: whisper-service
+    restart: unless-stopped
+    environment:
+      - WHISPER_MODEL=large-v3
+      - TRUST_PROXY_AUTH=true
+      - FLASK_SECRET_KEY=<generiere-32-bytes-hex>
+    volumes:
+      - whisper_models:/model_cache
+      - whisper_transcripts:/transcripts
+    networks:
+      - traefik
 
-Sicherstellen dass der Container im selben `traefik`-Netzwerk läuft:
-
-```yaml
 networks:
   traefik:
     external: true
+
+volumes:
+  whisper_models:
+  whisper_transcripts:
 ```
 
-### 2. Authelia OIDC-Client (für iOS-App)
+Traefik-Labels werden über einen File-Provider gesetzt (siehe [Traefik-Konfiguration](#traefik-konfiguration) unten).
 
-In `authelia-oidc-client.yml` liegt der fertige Snippet. In die Authelia-Konfiguration einfügen:
-
-```yaml
-identity_providers:
-  oidc:
-    clients:
-      - client_id: 'whisper-ios'
-        client_name: 'Whisper Memo iOS'
-        public: true                          # kein Client-Secret nötig
-        authorization_policy: 'one_factor'
-        redirect_uris:
-          - 'whispermemo://oauth/callback'    # Custom URL Scheme der iOS-App
-        scopes: [openid, profile, email]
-        grant_types: [authorization_code]
-        pkce_challenge_method: 'S256'
-        token_endpoint_auth_method: 'none'
-        access_token_lifespan: '1h'
-        refresh_token_lifespan: '90d'
+```bash
+docker compose up -d
+docker logs -f whisper-service          # warten bis "Model large-v3 loaded successfully."
 ```
 
-### 3. Auth-Flow
+### Web-UI öffnen
 
+`https://whisper.example.com` → Authelia-Login → Tab **App-Tokens** → Token für die iOS-App erstellen.
+
+### iOS-App installieren
+
+```bash
+cd ios
+brew install xcodegen        # nur einmal
+xcodegen generate
+open WhisperMemo.xcodeproj   # in Xcode → Build & Run aufs Gerät
 ```
-Browser:  Traefik → Authelia (Cookie-Session) → Remote-User Header → Flask ✓
-iOS-App:  Authelia OIDC (PKCE) → Access Token → Bearer → Traefik → Authelia validiert → Flask ✓
-```
+
+Beim ersten Start: Server-URL eintragen + den eben erstellten App-Token einfügen.
 
 ---
 
-## API
+## Konfiguration
 
-### GET /api/config
-Öffentlich — liefert OIDC-Konfiguration für die iOS-App.
-```bash
-curl https://whisper.example.com/api/config
-# → {"oidc_issuer": "...", "oidc_client_id": "whisper-ios", "model_default": "large-v3", ...}
-```
+### Server-Env-Vars
 
-### POST /api/transcribe
-Datei hochladen, Job-ID zurückbekommen:
-```bash
-curl -X POST https://whisper.example.com/api/transcribe \
-  -H "Authorization: Bearer <token>" \
-  -F "file=@aufnahme.m4a" \
-  -F "model=large-v3" \
-  -F "initial_prompt=Elektroinstallation Holzständerbau: NYM 3x1,5 mm²"
-# → {"job_id": "abc-123", "status": "queued"}
-```
-
-### GET /api/jobs/`<id>`
-Status und Ergebnis abfragen:
-```bash
-curl https://whisper.example.com/api/jobs/abc-123 \
-  -H "Authorization: Bearer <token>"
-# → {"status": "done", "full_text": "...", "segments": [...], "duration": 142.3}
-```
-
-### Warten bis fertig (Shell)
-```bash
-TOKEN="..."
-JOB_ID="abc-123"
-while true; do
-  RESP=$(curl -s https://whisper.example.com/api/jobs/$JOB_ID \
-    -H "Authorization: Bearer $TOKEN")
-  STATUS=$(echo $RESP | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
-  echo "Status: $STATUS"
-  [ "$STATUS" = "done" ] && echo $RESP | python3 -c "import sys,json; print(json.load(sys.stdin)['full_text'])" && break
-  [ "$STATUS" = "error" ] && echo "Fehler!" && break
-  sleep 3
-done
-```
-
-### GET /api/jobs
-Alle Jobs auflisten:
-```bash
-curl https://whisper.example.com/api/jobs \
-  -H "Authorization: Bearer <token>"
-```
-
-### POST /api/jobs/`<id>`/cancel
-Job abbrechen (Warteschlange oder laufend).
-
-### DELETE /api/jobs/`<id>`/delete
-Job aus der Liste entfernen.
-
-### GET /api/download/`<id>`/`<format>`
-Ergebnis herunterladen. Format: `txt`, `srt`, `json`.
-```bash
-curl https://whisper.example.com/api/download/abc-123/srt \
-  -H "Authorization: Bearer <token>" -o transkript.srt
-```
-
----
-
-## GPU (NVIDIA)
-
-Den `deploy`-Block in `docker-compose.yml` auskommentieren:
-
-```yaml
-deploy:
-  resources:
-    reservations:
-      devices:
-        - driver: nvidia
-          count: 1
-          capabilities: [gpu]
-```
-
-Mit GPU läuft large-v3 auf einer RTX 3080 in ~30 Sekunden für 8 Minuten Audio. Ohne GPU (CPU + int8) dauert es je nach Hardware 3–10×länger.
-
----
-
-## Volumes
-
-| Volume | Pfad im Container | Inhalt |
+| Variable | Default | Bedeutung |
 |---|---|---|
-| `whisper_models` | `/model_cache` | Modell-Dateien (large-v3 ≈ 3 GB) |
-| `whisper_transcripts` | `/transcripts` | Transkripte als `.txt` (Datum + Dateiname) |
+| `WHISPER_MODEL` | `large-v3` | Default-Modell; pro Job überschreibbar |
+| `TRUST_PROXY_AUTH` | `true` | `Remote-User`/`X-Forwarded-User` als Auth akzeptieren |
+| `FLASK_SECRET_KEY` | random | Persistente Session-Cookies über Restarts hinweg |
 
----
+### Persistente Dateien
 
-## Nginx Reverse Proxy (alternativ zu Traefik)
-
-```nginx
-location / {
-    proxy_pass http://localhost:5050/;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    client_max_body_size 500m;
-    proxy_read_timeout 600s;
-    proxy_send_timeout 600s;
-}
+```
+/transcripts/
+├── .tokens.json        ← Bearer-Tokens (vom UI verwaltet)
+├── .models.json        ← Custom-HuggingFace-Modelle
+└── *.txt               ← gespeicherte Transkripte (Dateiname = Timestamp)
+/model_cache/
+└── …                   ← faster-whisper download_root (gigabyte-große Modelle)
 ```
 
-HTTPS terminiert am Proxy — der Container läuft nur HTTP intern.
+### Traefik-Konfiguration
+
+Beispiel-File-Provider (`dynamic.yml`):
+
+```yaml
+http:
+  routers:
+    whisper-public:
+      rule: "Host(`whisper.example.com`) && (Path(`/health`) || Path(`/api/config`))"
+      service: whisper
+      entryPoints: [websecure]
+      tls: {}
+      priority: 30
+    whisper-api:
+      rule: "Host(`whisper.example.com`) && PathPrefix(`/api`)"
+      service: whisper
+      entryPoints: [websecure]
+      tls: {}
+      priority: 20
+    whisper-ui:
+      rule: "Host(`whisper.example.com`)"
+      service: whisper
+      entryPoints: [websecure]
+      tls: {}
+      priority: 10
+      middlewares: [authelia@docker]
+  services:
+    whisper:
+      loadBalancer:
+        servers:
+          - url: "http://whisper-service:5000"
+```
 
 ---
 
-## Verwandte Projekte
+## API-Referenz
 
-- **[whisper-memo-ios](https://github.com/mbay-ODW/whisper-memo-ios)** — Native iOS-App für Baustellenbegehungen (Aufnahme → Upload → Transkript)
+Alle Bearer-geschützten Endpunkte erwarten `Authorization: Bearer <token>`.
+
+| Method | Pfad | Zweck |
+|---|---|---|
+| `GET` | `/health` | Liveness + Modell-Status (public) |
+| `GET` | `/api/config` | Default-Modell + Liste verfügbarer Modelle (public) |
+| `GET` | `/api/model-status` | Modell-Loading-Status |
+| `POST` | `/api/upload` | Multi-File-Upload (form-data) |
+| `POST` | `/api/transcribe` | Single-File-Upload, gibt `job_id` zurück |
+| `GET` | `/api/jobs` | Job-Liste (Summary) |
+| `GET` | `/api/jobs/<id>` | Job-Detail inkl. Transkript |
+| `POST` | `/api/jobs/<id>/cancel` | Laufenden Job abbrechen |
+| `POST` | `/api/jobs/<id>/retry` | Fehlerhaften Job neu starten |
+| `DELETE` | `/api/jobs/<id>/delete` | Job löschen |
+| `GET` | `/api/download/<id>/<fmt>` | `txt` · `srt` · `json` |
+| `GET` | `/api/models` | Built-in + Custom-Modelle |
+| `POST` | `/api/models/add` | Custom-Modell hinzufügen (Browser-Session) |
+| `POST` | `/api/models/<name>/delete` | Custom-Modell entfernen (Browser-Session) |
+| `GET` | `/tokens` | Token-Liste (Browser-Session) |
+| `POST` | `/tokens/create` | Token erstellen (Browser-Session) |
+| `POST` | `/tokens/<value>/delete` | Token widerrufen (Browser-Session) |
+
+> Token-Endpunkte liegen unter `/tokens/`, _nicht_ `/api/tokens/` — sie müssen durch den `whisper-ui` Router (mit Authelia) gehen, damit `Remote-User` gesetzt wird.
+
+### Beispiel: Job per cURL
+
+```bash
+TOKEN="dein-app-token"
+curl -X POST https://whisper.example.com/api/transcribe \
+  -H "Authorization: Bearer $TOKEN" \
+  -F file=@aufnahme.m4a \
+  -F model=large-v3 \
+  -F initial_prompt="Elektroinstallation Holzständerbau …"
+# → {"job_id":"...","status":"queued"}
+```
+
+---
+
+## Development
+
+### Server lokal starten
+
+```bash
+cd server
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+TRUST_PROXY_AUTH=false python -m app.main
+# → http://localhost:5000
+```
+
+`TRUST_PROXY_AUTH=false` deaktiviert die Authelia-Prüfung; du brauchst dann einen Bearer-Token in `/transcripts/.tokens.json`:
+
+```bash
+mkdir -p /tmp/transcripts && echo '{"dev-token": "Lokal"}' > /tmp/transcripts/.tokens.json
+```
+
+### Image manuell bauen
+
+```bash
+docker build -t whisper-service:dev server/
+```
+
+### CI-Pipeline
+
+Push auf `main` mit Änderungen unter `server/` triggert [`.github/workflows/build.yml`](./.github/workflows/build.yml). Image landet als `ghcr.io/mbay-odw/whisper-service:latest` und `:<sha>`.
+
+Stack-Redeploy auf TrueNAS via Portainer-API:
+
+```bash
+TOKEN="ptr_…"
+curl -X PUT -H "X-API-Key: $TOKEN" -H "Content-Type: application/json" \
+  -d @stack-payload.json \
+  "https://portainer.example.com/api/stacks/49?endpointId=1"
+```
+
+### iOS-App in Xcode
+
+```bash
+cd ios
+xcodegen generate          # nach jeder neuen .swift-Datei
+open WhisperMemo.xcodeproj
+```
+
+Code-Signing-Team in `project.yml` setzen, dann Build & Run.
+
+---
+
+## Roadmap-Ideen
+
+- [ ] WebSocket-Live-Updates statt Polling
+- [ ] Multi-User mit Per-User-Token-Scopes
+- [ ] Suche über alle Transkripte (Volltext)
+- [ ] iOS Share-Extension: aus anderen Apps direkt hochladen
+- [ ] Watch-App für One-Tap-Aufnahme vom Handgelenk
+
+---
+
+## Lizenz
+
+MIT — siehe [`LICENSE`](./LICENSE).
