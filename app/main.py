@@ -10,7 +10,6 @@ from pathlib import Path
 from datetime import datetime
 from collections import OrderedDict
 
-import jwt
 import requests as http_requests
 from flask import Flask, request, jsonify, render_template, abort, send_file, Response
 from werkzeug.utils import secure_filename
@@ -44,60 +43,19 @@ DEFAULT_PROMPT = (
 )
 
 
-# JWKS cache: (keys_dict, fetched_at)
-_jwks_cache = (None, 0)
-_jwks_lock = threading.Lock()
-JWKS_TTL = 3600  # refresh every hour
-
-
-def _get_jwks():
-    global _jwks_cache
-    with _jwks_lock:
-        keys, fetched_at = _jwks_cache
-        if keys and time.time() - fetched_at < JWKS_TTL:
-            return keys
-    try:
-        disc = http_requests.get(
-            f"{OIDC_ISSUER}/.well-known/openid-configuration", timeout=5
-        ).json()
-        jwks = http_requests.get(disc["jwks_uri"], timeout=5).json()
-        keys = {k["kid"]: k for k in jwks.get("keys", [])}
-        with _jwks_lock:
-            _jwks_cache = (keys, time.time())
-        return keys
-    except Exception as e:
-        print(f"JWKS fetch error: {e}", flush=True)
-        return {}
-
-
-def _validate_jwt(token: str) -> bool:
+def _validate_oidc_token(token: str) -> bool:
+    """Ask Authelia's userinfo endpoint if the Bearer token is valid."""
     if not OIDC_ISSUER:
         return False
     try:
-        header = jwt.get_unverified_header(token)
-        kid = header.get("kid", "")
-        keys = _get_jwks()
-        raw_key = keys.get(kid)
-        if not raw_key:
-            # Retry once with fresh JWKS (key rotation)
-            with _jwks_lock:
-                global _jwks_cache
-                _jwks_cache = (None, 0)
-            keys = _get_jwks()
-            raw_key = keys.get(kid)
-        if not raw_key:
-            return False
-        public_key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(raw_key))
-        jwt.decode(
-            token,
-            public_key,
-            algorithms=["RS256"],
-            issuer=OIDC_ISSUER,
-            options={"verify_aud": False},  # public client, aud varies
+        r = http_requests.get(
+            f"{OIDC_ISSUER}/api/oidc/userinfo",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=3,
         )
-        return True
+        return r.status_code == 200
     except Exception as e:
-        print(f"JWT validation error: {e}", flush=True)
+        print(f"OIDC userinfo error: {e}", flush=True)
         return False
 
 
@@ -110,8 +68,8 @@ def check_auth(req):
     auth_header = req.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
-        # 2. OIDC JWT von Authelia (iOS-App)
-        if _validate_jwt(token):
+        # 2. OIDC Bearer Token → Authelia userinfo-Validierung
+        if _validate_oidc_token(token):
             return True
         # 3. Statischer AUTH_TOKEN (Entwicklung / Fallback)
         if AUTH_TOKEN and token == AUTH_TOKEN:
