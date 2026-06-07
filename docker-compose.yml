@@ -5,30 +5,15 @@ services:
     restart: unless-stopped
     environment:
       - WHISPER_MODEL=${WHISPER_MODEL:-large-v3}
-      # Fallback-Token für direkten Zugriff / lokale Entwicklung.
-      # Im Produktionsbetrieb hinter Traefik+Authelia leer lassen.
-      - AUTH_TOKEN=${AUTH_TOKEN:-}
       - TRUST_PROXY_AUTH=${TRUST_PROXY_AUTH:-true}
-      # OIDC-Konfiguration – wird an die iOS-App via /api/config geliefert
-      - OIDC_ISSUER=${OIDC_ISSUER:-https://auth.example.com}
-      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID:-whisper-ios}
+      - FLASK_SECRET_KEY=${FLASK_SECRET_KEY:-}
     volumes:
       - whisper_models:/model_cache
       - whisper_transcripts:/transcripts
     networks:
       - traefik
     labels:
-      - "traefik.enable=true"
-      # Hostname anpassen – WHISPER_HOST in .env setzen
-      - "traefik.http.routers.whisper.rule=Host(`${WHISPER_HOST:-whisper.example.com}`)"
-      - "traefik.http.routers.whisper.entrypoints=websecure"
-      - "traefik.http.routers.whisper.tls=true"
-      # Authelia-Middleware – Name muss mit Authelia-Container übereinstimmen
-      - "traefik.http.routers.whisper.middlewares=authelia@docker"
-      - "traefik.http.services.whisper.loadbalancer.server.port=5000"
-    # Direkter Port nur für lokale Entwicklung (ohne Traefik):
-    # ports:
-    #   - "5050:5000"
+      - "traefik.enable=false"
 
 networks:
   traefik:
