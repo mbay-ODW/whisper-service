@@ -9,6 +9,9 @@ settings:
   base:
     SWIFT_VERSION: 5.9
     DEVELOPMENT_TEAM: ""
+    # Xcode "Update to recommended settings" — baked in so xcodegen keeps them
+    ENABLE_USER_SCRIPT_SANDBOXING: "YES"
+    LOCALIZATION_PREFERS_STRING_CATALOGS: "YES"
 
 targets:
   WhisperMemo:
