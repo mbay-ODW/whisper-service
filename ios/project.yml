@@ -9,6 +9,8 @@ settings:
   base:
     SWIFT_VERSION: 5.9
     DEVELOPMENT_TEAM: ""
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
     # Xcode "Update to recommended settings" — baked in so xcodegen keeps them
     ENABLE_USER_SCRIPT_SANDBOXING: "YES"
     LOCALIZATION_PREFERS_STRING_CATALOGS: "YES"
@@ -33,7 +35,7 @@ targets:
           UIColorName: ""
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
-        NSMicrophoneUsageDescription: "WhisperMemo benötigt das Mikrofon für Sprachaufnahmen auf der Baustelle."
+        NSMicrophoneUsageDescription: "WhisperMemo benötigt das Mikrofon, um deine Sprachmemos aufzunehmen."
         UIBackgroundModes:
           - audio
     settings:

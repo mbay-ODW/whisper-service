@@ -21,7 +21,7 @@
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>WhisperMemo benötigt das Mikrofon für Sprachaufnahmen auf der Baustelle.</string>
+	<string>WhisperMemo benötigt das Mikrofon, um deine Sprachmemos aufzunehmen.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

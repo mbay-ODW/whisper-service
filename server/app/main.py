@@ -84,12 +84,10 @@ jobs_lock = threading.Lock()
 import queue
 job_queue = queue.Queue()
 
-DEFAULT_PROMPT = (
-    "Elektroinstallation Holzständerbau: Gefach, Ständer, Fertigwand, "
-    "Fertigfußboden FFB, Laibung, NYM 3x1,5 mm², 5x1,5, 3x2,5, 4x1,5, "
-    "Rollladen, Schalterdose, Steckdose, Spiegelschrank, Heizkreisverteiler, "
-    "Stellantrieb, Pendellüfter, Empore, HWR, Zentimeter, Meter"
-)
+# Leerer Default — User können pro Job ein Fachvokabular (initial_prompt) mitgeben.
+# faster-whisper benötigt den Prompt nicht; er verbessert nur Erkennung
+# bei domänenspezifischen Begriffen.
+DEFAULT_PROMPT = ""
 
 
 def check_auth(req) -> bool:

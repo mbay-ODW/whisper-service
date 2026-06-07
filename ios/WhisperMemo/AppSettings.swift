@@ -8,7 +8,10 @@ final class AppSettings: ObservableObject {
     @Published var availableModels: [String]
     @Published var defaultPrompt: String
 
-    static let defaultPrompt = "Elektroinstallation Holzständerbau: Gefach, Ständer, Fertigwand, Fertigfußboden FFB, Laibung, NYM 3x1,5 mm², 5x1,5, 3x2,5, 4x1,5, Rollladen, Schalterdose, Steckdose, Spiegelschrank, Heizkreisverteiler, Stellantrieb, Pendellüfter, Empore, HWR, Zentimeter, Meter"
+    /// Leerer Default — User pflegt eigenes Fachvokabular bei Bedarf.
+    /// faster-whisper braucht den Initial-Prompt nicht; er hilft nur bei
+    /// domänenspezifischen Begriffen (Medizin, Recht, Technik …).
+    static let defaultPrompt = ""
 
     private var cancellables = Set<AnyCancellable>()
     private let ud = UserDefaults.standard

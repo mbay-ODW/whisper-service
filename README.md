@@ -1,8 +1,8 @@
 # Whisper Service
 
-> Selbst gehostete Sprache-zu-Text-Pipeline für die Baustelle — Server, Web-UI und native iOS-App in einem Repo.
+> Selbst gehostete Sprache-zu-Text-Pipeline — Server, Web-UI und native iOS-App in einem Repo.
 
-Nimm Memos auf der Baustelle auf, lass sie automatisch per [faster-whisper](https://github.com/SYSTRAN/faster-whisper) transkribieren, durchsuche und teile die Ergebnisse. Datenhoheit bleibt zu Hause — auf deinem Server.
+Nimm Sprachmemos auf, lass sie automatisch per [faster-whisper](https://github.com/SYSTRAN/faster-whisper) transkribieren, durchsuche und teile die Ergebnisse. Datenhoheit bleibt zu Hause — auf deinem Server. Geeignet für Notizen, Interviews, Meetings, Podcasts, Vorlesungen, Diktate — alles wofür du Audio zu deutschem Text brauchst.
 
 ---
 
@@ -38,7 +38,7 @@ Nimm Memos auf der Baustelle auf, lass sie automatisch per [faster-whisper](http
 - 📶 **Offline-Queue** — Aufnahmen werden lokal gespeichert und automatisch hochgeladen, sobald der Server erreichbar ist
 - 🩺 **Echte Reachability** — Server-`/health` wird alle 30 s geprobet (nicht nur NWPathMonitor)
 - 📊 **Statistik & Speicher** — lokaler Footprint, Queue-Größe, verwaiste Aufnahmen aufräumen
-- 🗣 **Initial Prompt** für Fachvokabular (Elektroinstallation, Holzständerbau, etc.)
+- 🗣 **Initial Prompt** für eigenes Fachvokabular (Medizin, Recht, Technik, …)
 - 📤 **Teilen** über das native Share-Sheet (Swipe oder Toolbar)
 
 ---
@@ -227,7 +227,7 @@ curl -X POST https://whisper.example.com/api/transcribe \
   -H "Authorization: Bearer $TOKEN" \
   -F file=@aufnahme.m4a \
   -F model=large-v3 \
-  -F initial_prompt="Elektroinstallation Holzständerbau …"
+  -F initial_prompt="optionales Fachvokabular …"
 # → {"job_id":"...","status":"queued"}
 ```
 
