@@ -20,6 +20,11 @@ app.config["SESSION_COOKIE_SECURE"] = True
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Strict"
 
+# Hard cap on upload size — defends against disk-fill by a leaked bearer token.
+# Default 2 GiB; override via MAX_UPLOAD_MB env var.
+_max_mb = int(os.environ.get("MAX_UPLOAD_MB", "2048"))
+app.config["MAX_CONTENT_LENGTH"] = _max_mb * 1024 * 1024
+
 TRUST_PROXY_AUTH = os.environ.get("TRUST_PROXY_AUTH", "true").lower() == "true"
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
 TRANSCRIPTS_DIR = Path("/transcripts")
@@ -343,11 +348,18 @@ for _ in range(NUM_WORKERS):
 
 @app.before_request
 def require_auth():
-    # Öffentliche Endpunkte: Health-Check und OIDC-Config (für iOS-App-Setup)
+    # Public endpoints: health probes + minimal config for iOS app setup
     if request.path in ("/health", "/api/config"):
         return
     if not check_auth(request):
         abort(401)
+
+
+@app.errorhandler(413)
+def request_too_large(_):
+    return jsonify({
+        "error": f"Datei zu groß (Limit: {_max_mb} MB)"
+    }), 413
 
 
 @app.route("/")
