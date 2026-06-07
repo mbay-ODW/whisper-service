@@ -1,6 +1,6 @@
 services:
   whisper:
-    build: .
+    image: ghcr.io/mbay-odw/whisper-service:latest
     container_name: whisper-service
     restart: unless-stopped
     environment:
