@@ -7,9 +7,35 @@ services:
       - WHISPER_MODEL=${WHISPER_MODEL:-large-v3}
       - TRUST_PROXY_AUTH=${TRUST_PROXY_AUTH:-true}
       - FLASK_SECRET_KEY=${FLASK_SECRET_KEY:-}
+      - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-2048}
     volumes:
       - whisper_models:/model_cache
       - whisper_transcripts:/transcripts
+    networks:
+      - traefik
+    labels:
+      - "traefik.enable=false"
+
+  # MCP-Server für Claude.ai / Claude Desktop. Redet intern über das traefik-Netz
+  # direkt mit whisper-service — keine TLS, keine Authelia, keine Rate-Limits dazwischen.
+  whisper-mcp:
+    image: ghcr.io/mbay-odw/whisper-mcp-server:latest
+    container_name: whisper-mcp-server
+    restart: unless-stopped
+    depends_on:
+      - whisper
+    environment:
+      - LOG_LEVEL=INFO
+      - MCP_TRANSPORT=sse
+      - PORT=8000
+      - WHISPER_URL=http://whisper-service:5000
+      - WHISPER_BEARER=${WHISPER_BEARER}
+      - MCP_API_KEY=${MCP_API_KEY}
+      - OIDC_INTROSPECTION_URL=${OIDC_INTROSPECTION_URL:-https://authelia.bay-ram.de/api/oidc/introspection}
+      - OIDC_CLIENT_ID=whisper-mcp
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET}
+    expose:
+      - "8000"
     networks:
       - traefik
     labels:
