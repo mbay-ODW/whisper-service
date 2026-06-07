@@ -96,6 +96,20 @@ select{min-width:140px}
 
 .empty-state{text-align:center;padding:32px;color:#475569;font-size:.875rem}
 
+/* Recorder */
+.recorder-row{display:flex;flex-direction:column;align-items:center;gap:14px;padding:8px 0}
+.record-btn{width:88px;height:88px;border-radius:50%;border:none;background:#4f46e5;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .2s;box-shadow:0 0 0 0 rgba(99,102,241,.5)}
+.record-btn:hover{background:#6366f1}
+.record-btn.recording{background:#ef4444;animation:pulse-record 1.4s infinite}
+.record-btn:disabled{background:#2d3748;color:#475569;cursor:not-allowed;animation:none}
+@keyframes pulse-record{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,.55)}50%{box-shadow:0 0 0 16px rgba(239,68,68,0)}}
+.record-btn svg{width:34px;height:34px}
+.record-timer{font-size:2.2rem;font-weight:300;font-variant-numeric:tabular-nums;color:#94a3b8;letter-spacing:.03em}
+.record-timer.recording{color:#ef4444}
+.record-status{font-size:.8rem;color:#64748b}
+.record-level{display:flex;gap:3px;align-items:flex-end;height:32px;width:160px;justify-content:center}
+.record-level .bar{width:4px;background:#ef4444;border-radius:2px;transition:height .08s ease-out}
+
 /* Toast */
 #toast{position:fixed;bottom:24px;right:24px;background:#1e2432;border:1px solid #2d3748;color:#e2e8f0;padding:10px 16px;border-radius:8px;font-size:.8rem;opacity:0;transition:opacity .3s;pointer-events:none;z-index:999}
 #toast.show{opacity:1}
@@ -126,6 +140,19 @@ select{min-width:140px}
 </div>
 
 <div class="tab-content active" id="tab-content-transcribe">
+  <div class="card" id="recorder-card">
+    <div class="card-title">Aufnehmen</div>
+    <div class="recorder-row">
+      <div class="record-timer" id="record-timer">00:00</div>
+      <div class="record-level" id="record-level"></div>
+      <button class="record-btn" id="record-btn" onclick="toggleRecord()" aria-label="Aufnahme starten">
+        <svg viewBox="0 0 24 24" fill="currentColor" id="record-icon-mic"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.93V21h2v-3.07A7 7 0 0 0 19 11h-2Z"/></svg>
+        <svg viewBox="0 0 24 24" fill="currentColor" id="record-icon-stop" style="display:none"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+      </button>
+      <div class="record-status" id="record-status">Tippen zum Aufnehmen</div>
+    </div>
+  </div>
+
   <div class="card">
     <div class="card-title">Transkription</div>
     <div class="settings-row">
@@ -674,6 +701,180 @@ async function deleteModel(name) {
 }
 
 loadModels();
+
+// ── Recorder (Browser) ──────────────────────────────────────────────────
+let mediaRecorder = null;
+let recordChunks = [];
+let recordStartTime = 0;
+let recordTimerInterval = null;
+let recordAudioCtx = null;
+let recordAnalyser = null;
+let recordRafId = null;
+let recordStream = null;
+
+function pickAudioMime() {
+  // iOS Safari preferiert mp4, andere webm/opus
+  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/aac'];
+  for (const m of candidates) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return m;
+  }
+  return '';
+}
+
+async function toggleRecord() {
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    stopRecord();
+  } else {
+    await startRecord();
+  }
+}
+
+async function startRecord() {
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    showToast('Browser unterstützt keine Aufnahme', true);
+    return;
+  }
+  try {
+    recordStream = await navigator.mediaDevices.getUserMedia({audio: true});
+  } catch(e) {
+    showToast('Mikrofon-Zugriff verweigert', true);
+    return;
+  }
+
+  const mime = pickAudioMime();
+  try {
+    mediaRecorder = new MediaRecorder(recordStream, mime ? {mimeType: mime} : {});
+  } catch(e) {
+    showToast('Aufnahme nicht möglich: ' + e.message, true);
+    stopStream();
+    return;
+  }
+
+  recordChunks = [];
+  mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordChunks.push(e.data); };
+  mediaRecorder.onstop = handleRecordStop;
+  mediaRecorder.start();
+
+  recordStartTime = Date.now();
+  setRecordingUI(true);
+  recordTimerInterval = setInterval(updateRecordTimer, 100);
+  startLevelMeter();
+}
+
+function stopRecord() {
+  if (!mediaRecorder) return;
+  try { mediaRecorder.stop(); } catch(e) {}
+  clearInterval(recordTimerInterval);
+  stopLevelMeter();
+  setRecordingUI(false);
+}
+
+function stopStream() {
+  if (recordStream) {
+    recordStream.getTracks().forEach(t => t.stop());
+    recordStream = null;
+  }
+}
+
+function handleRecordStop() {
+  const mime = mediaRecorder.mimeType || 'audio/webm';
+  const ext = mime.includes('mp4') || mime.includes('aac') ? 'm4a'
+            : mime.includes('webm') ? 'webm'
+            : 'webm';
+  const blob = new Blob(recordChunks, {type: mime});
+  stopStream();
+  mediaRecorder = null;
+
+  if (blob.size < 1024) {
+    showToast('Aufnahme zu kurz', true);
+    return;
+  }
+  uploadRecording(blob, ext);
+}
+
+async function uploadRecording(blob, ext) {
+  const filename = `memo_${new Date().toISOString().replace(/[:.]/g,'-')}.${ext}`;
+  const fd = new FormData();
+  fd.append('files', blob, filename);
+  fd.append('initial_prompt', document.getElementById('prompt-input').value);
+  fd.append('model', document.getElementById('model-select').value);
+
+  const btn = document.getElementById('record-btn');
+  btn.disabled = true;
+  document.getElementById('record-status').textContent = 'Lädt hoch…';
+
+  try {
+    const r = await apiFetch('/api/upload', {method:'POST', body: fd});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Upload fehlgeschlagen');
+    showToast('Aufnahme hochgeladen, Transkription startet');
+    refreshJobs();
+  } catch(e) {
+    showToast('Fehler: ' + e.message, true);
+  } finally {
+    btn.disabled = false;
+    document.getElementById('record-status').textContent = 'Tippen zum Aufnehmen';
+    document.getElementById('record-timer').textContent = '00:00';
+  }
+}
+
+function setRecordingUI(rec) {
+  document.getElementById('record-btn').classList.toggle('recording', rec);
+  document.getElementById('record-timer').classList.toggle('recording', rec);
+  document.getElementById('record-icon-mic').style.display  = rec ? 'none' : '';
+  document.getElementById('record-icon-stop').style.display = rec ? '' : 'none';
+  document.getElementById('record-status').textContent = rec ? 'Tippen zum Stoppen' : 'Tippen zum Aufnehmen';
+  document.getElementById('record-btn').setAttribute('aria-label', rec ? 'Aufnahme stoppen' : 'Aufnahme starten');
+}
+
+function updateRecordTimer() {
+  const elapsed = (Date.now() - recordStartTime) / 1000;
+  const m = Math.floor(elapsed / 60), s = Math.floor(elapsed % 60);
+  document.getElementById('record-timer').textContent =
+    `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+}
+
+// ── Live level meter ────────────────────────────────────────────────────
+function startLevelMeter() {
+  try {
+    recordAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const source = recordAudioCtx.createMediaStreamSource(recordStream);
+    recordAnalyser = recordAudioCtx.createAnalyser();
+    recordAnalyser.fftSize = 256;
+    source.connect(recordAnalyser);
+  } catch(e) { return; }
+
+  const level = document.getElementById('record-level');
+  level.innerHTML = '';
+  const bars = [];
+  for (let i = 0; i < 24; i++) {
+    const b = document.createElement('div');
+    b.className = 'bar';
+    b.style.height = '4px';
+    level.appendChild(b);
+    bars.push(b);
+  }
+
+  const data = new Uint8Array(recordAnalyser.frequencyBinCount);
+  const draw = () => {
+    if (!recordAnalyser) return;
+    recordAnalyser.getByteFrequencyData(data);
+    const step = Math.floor(data.length / bars.length);
+    for (let i = 0; i < bars.length; i++) {
+      const v = data[i * step] / 255;
+      bars[i].style.height = Math.max(4, v * 32) + 'px';
+    }
+    recordRafId = requestAnimationFrame(draw);
+  };
+  draw();
+}
+
+function stopLevelMeter() {
+  if (recordRafId) { cancelAnimationFrame(recordRafId); recordRafId = null; }
+  if (recordAudioCtx) { recordAudioCtx.close().catch(()=>{}); recordAudioCtx = null; }
+  recordAnalyser = null;
+  document.getElementById('record-level').innerHTML = '';
+}
 </script>
 </body>
 </html>
