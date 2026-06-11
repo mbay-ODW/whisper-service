@@ -729,6 +729,35 @@ async function toggleRecord() {
   }
 }
 
+// Wake Lock — verhindert Screen-Sleep während Aufnahme (iOS Safari 16.4+, Chrome, Edge, FF)
+let wakeLock = null;
+async function acquireWakeLock() {
+  if (!('wakeLock' in navigator)) return false;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = null; });
+    return true;
+  } catch(e) {
+    console.warn('WakeLock denied:', e);
+    return false;
+  }
+}
+async function releaseWakeLock() {
+  if (!wakeLock) return;
+  try { await wakeLock.release(); } catch(e) {}
+  wakeLock = null;
+}
+// Falls Browser doch in den Hintergrund geht, neu anfordern wenn er zurückkommt
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && mediaRecorder?.state === 'recording' && !wakeLock) {
+    await acquireWakeLock();
+  }
+});
+
+// Erkennung dass die Aufnahme unterbrochen wurde
+let lastChunkTime = 0;
+let recordWatchdog = null;
+
 async function startRecord() {
   if (!navigator.mediaDevices || !window.MediaRecorder) {
     showToast('Browser unterstützt keine Aufnahme', true);
@@ -743,6 +772,7 @@ async function startRecord() {
 
   const mime = pickAudioMime();
   try {
+    // Timeslice — alle 1000ms Chunk-Callback feuern lassen. So merken wir wenn Stream einfriert.
     mediaRecorder = new MediaRecorder(recordStream, mime ? {mimeType: mime} : {});
   } catch(e) {
     showToast('Aufnahme nicht möglich: ' + e.message, true);
@@ -751,21 +781,47 @@ async function startRecord() {
   }
 
   recordChunks = [];
-  mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordChunks.push(e.data); };
+  lastChunkTime = Date.now();
+  mediaRecorder.ondataavailable = e => {
+    if (e.data.size > 0) {
+      recordChunks.push(e.data);
+      lastChunkTime = Date.now();
+    }
+  };
   mediaRecorder.onstop = handleRecordStop;
-  mediaRecorder.start();
+  mediaRecorder.onerror = e => {
+    console.error('MediaRecorder error:', e);
+    showToast('Aufnahme-Fehler — bitte stoppen', true);
+  };
+  // Timeslice 1000ms = pro Sekunde ein Chunk-Event. iOS Safari < 16 ignoriert das, andere Browser nutzen es.
+  mediaRecorder.start(1000);
+
+  await acquireWakeLock();
 
   recordStartTime = Date.now();
   setRecordingUI(true);
   recordTimerInterval = setInterval(updateRecordTimer, 100);
   startLevelMeter();
+
+  // Watchdog: wenn 12s keine Chunks ankommen UND Tab versteckt — Recorder ist eingefroren
+  recordWatchdog = setInterval(() => {
+    if (!mediaRecorder || mediaRecorder.state !== 'recording') return;
+    const stalled = Date.now() - lastChunkTime > 12000;
+    if (stalled && document.visibilityState !== 'visible') {
+      console.warn('Recorder stalled in background — stopping cleanly');
+      showToast('Aufnahme im Hintergrund unterbrochen — speichere bisher Aufgenommenes', true);
+      stopRecord();
+    }
+  }, 4000);
 }
 
 function stopRecord() {
   if (!mediaRecorder) return;
   try { mediaRecorder.stop(); } catch(e) {}
   clearInterval(recordTimerInterval);
+  if (recordWatchdog) { clearInterval(recordWatchdog); recordWatchdog = null; }
   stopLevelMeter();
+  releaseWakeLock();
   setRecordingUI(false);
 }
 
