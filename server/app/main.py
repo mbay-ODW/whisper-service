@@ -31,13 +31,20 @@ TRANSCRIPTS_DIR = Path("/transcripts")
 MODEL_CACHE_DIR = Path("/model_cache")
 TOKENS_FILE = TRANSCRIPTS_DIR / ".tokens.json"
 MODELS_FILE = TRANSCRIPTS_DIR / ".models.json"
+SESSIONS_DIR = TRANSCRIPTS_DIR / ".recording-sessions"
 TRANSCRIPTS_DIR.mkdir(exist_ok=True)
+SESSIONS_DIR.mkdir(exist_ok=True)
 
 # Built-in models always available (downloaded by faster-whisper on demand)
 BUILTIN_MODELS = ["large-v3", "medium", "small", "base"]
 
+# Recording-Session-Cleanup: nach wie vielen Sekunden ohne neuen Chunk
+# wird eine verwaiste Session automatisch finalisiert (= das was da ist transkribiert).
+SESSION_AUTO_FINALIZE_AFTER = int(os.environ.get("SESSION_AUTO_FINALIZE_AFTER", "300"))  # 5 min
+
 _tokens_lock = threading.Lock()
 _models_lock = threading.Lock()
+_sessions_lock = threading.Lock()
 
 
 def _load_tokens() -> dict:
@@ -474,6 +481,189 @@ def model_status():
         "error": _model_error,
         "model": WHISPER_MODEL,
     })
+
+
+# ── Recording-Sessions ────────────────────────────────────────────────────
+# Chunked-Upload für Browser-Aufnahmen. Klient POSTed alle 2s einen Audio-Chunk.
+# Wenn iOS Safari beim App-Switch den Recorder kickt, hat der Server schon alles
+# was bis dahin aufgenommen wurde. Background-Worker finalisiert verwaiste Sessions
+# automatisch nach SESSION_AUTO_FINALIZE_AFTER Sekunden ohne neuen Chunk.
+
+
+def _create_job_from_file(filename: str, file_path: str, initial_prompt: str, model_name: str) -> str:
+    job_id = str(uuid.uuid4())
+    job = {
+        "id": job_id, "status": "queued", "progress": 0,
+        "original_filename": filename, "file_path": file_path,
+        "initial_prompt": initial_prompt, "model": model_name,
+        "created_at": time.time(), "segments": [], "full_text": "",
+        "error": None, "cancelled": False,
+    }
+    with jobs_lock:
+        jobs[job_id] = job
+    job_queue.put(job_id)
+    return job_id
+
+
+def _finalize_session(session_path: Path) -> dict:
+    """Konkateniert alle Chunks → Audiodatei → queued als Job. Cleanup der Session."""
+    meta_file = session_path / "meta.json"
+    if not meta_file.exists():
+        shutil.rmtree(session_path, ignore_errors=True)
+        return {"error": "no meta"}
+    meta = json.loads(meta_file.read_text())
+    chunks = sorted(session_path.glob("chunk-*.bin"))
+    if not chunks:
+        shutil.rmtree(session_path, ignore_errors=True)
+        return {"error": "no chunks"}
+
+    upload_dir = Path(tempfile.mkdtemp(prefix="whisper_upload_"))
+    ext = meta.get("ext", "webm")
+    filename = f"{meta.get('owner', 'memo')}_{int(meta['created_at'])}.{ext}"
+    dest = upload_dir / filename
+    total_size = 0
+    with open(dest, "wb") as out:
+        for c in chunks:
+            data = c.read_bytes()
+            out.write(data)
+            total_size += len(data)
+
+    shutil.rmtree(session_path, ignore_errors=True)
+    job_id = _create_job_from_file(
+        filename=filename,
+        file_path=str(dest),
+        initial_prompt=meta.get("initial_prompt", DEFAULT_PROMPT),
+        model_name=meta.get("model", WHISPER_MODEL),
+    )
+    return {"job_id": job_id, "chunks": len(chunks), "size": total_size}
+
+
+@app.route("/api/record/init", methods=["POST"])
+def record_init():
+    data = request.get_json(silent=True) or {}
+    ext = (data.get("ext") or "webm").lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        return jsonify({"error": "Unsupported ext"}), 400
+    session_id = str(uuid.uuid4())
+    session_path = SESSIONS_DIR / session_id
+    session_path.mkdir(exist_ok=True)
+    meta = {
+        "id": session_id,
+        "created_at": time.time(),
+        "mime": data.get("mime", "audio/webm"),
+        "ext": ext,
+        "model": data.get("model", WHISPER_MODEL),
+        "initial_prompt": data.get("initial_prompt", DEFAULT_PROMPT),
+        "owner": (data.get("owner") or "memo")[:50],
+    }
+    (session_path / "meta.json").write_text(json.dumps(meta))
+    return jsonify({"session_id": session_id}), 201
+
+
+@app.route("/api/record/append", methods=["POST"])
+def record_append():
+    sid = request.args.get("session_id", "")
+    try:
+        seq = int(request.args.get("seq", "-1"))
+    except ValueError:
+        seq = -1
+    # Pfad-Traversal-Schutz
+    if not sid or "/" in sid or ".." in sid or seq < 0 or seq > 99999:
+        return jsonify({"error": "bad args"}), 400
+    session_path = SESSIONS_DIR / sid
+    if not session_path.is_dir() or not (session_path / "meta.json").exists():
+        return jsonify({"error": "no session"}), 404
+    data = request.get_data()
+    if not data:
+        return jsonify({"error": "empty chunk"}), 400
+    (session_path / f"chunk-{seq:05d}.bin").write_bytes(data)
+    return jsonify({"ok": True, "seq": seq, "size": len(data)})
+
+
+@app.route("/api/record/finalize", methods=["POST"])
+def record_finalize():
+    sid = request.args.get("session_id", "")
+    if not sid or "/" in sid or ".." in sid:
+        return jsonify({"error": "bad session_id"}), 400
+    session_path = SESSIONS_DIR / sid
+    if not session_path.is_dir():
+        return jsonify({"error": "no session"}), 404
+    result = _finalize_session(session_path)
+    if "error" in result:
+        return jsonify(result), 400
+    return jsonify(result), 202
+
+
+@app.route("/api/record/cancel", methods=["POST"])
+def record_cancel():
+    sid = request.args.get("session_id", "")
+    if not sid or "/" in sid or ".." in sid:
+        return jsonify({"error": "bad session_id"}), 400
+    session_path = SESSIONS_DIR / sid
+    if session_path.is_dir():
+        shutil.rmtree(session_path, ignore_errors=True)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/record/sessions")
+def record_sessions():
+    """Liste aller laufenden/orphan Sessions, damit User sie ggf. manuell finalisieren kann."""
+    out = []
+    for p in SESSIONS_DIR.iterdir():
+        if not p.is_dir():
+            continue
+        meta_file = p / "meta.json"
+        if not meta_file.exists():
+            continue
+        try:
+            meta = json.loads(meta_file.read_text())
+        except Exception:
+            continue
+        chunks = list(p.glob("chunk-*.bin"))
+        last_chunk = max((c.stat().st_mtime for c in chunks), default=meta_file.stat().st_mtime)
+        total_size = sum(c.stat().st_size for c in chunks)
+        out.append({
+            "session_id": meta["id"],
+            "created_at": meta["created_at"],
+            "last_activity": last_chunk,
+            "chunks": len(chunks),
+            "size": total_size,
+            "owner": meta.get("owner", ""),
+        })
+    return jsonify(out)
+
+
+def session_cleanup_worker():
+    """Hintergrund-Worker: finalisiert verwaiste Sessions nach Timeout."""
+    while True:
+        try:
+            now = time.time()
+            for session_path in list(SESSIONS_DIR.iterdir()):
+                if not session_path.is_dir():
+                    continue
+                meta_file = session_path / "meta.json"
+                if not meta_file.exists():
+                    if now - session_path.stat().st_mtime > 600:
+                        shutil.rmtree(session_path, ignore_errors=True)
+                    continue
+                chunks = list(session_path.glob("chunk-*.bin"))
+                if not chunks:
+                    # Leere Session > 10 min: löschen
+                    if now - meta_file.stat().st_mtime > 600:
+                        shutil.rmtree(session_path, ignore_errors=True)
+                    continue
+                last_chunk = max(c.stat().st_mtime for c in chunks)
+                if now - last_chunk > SESSION_AUTO_FINALIZE_AFTER:
+                    print(f"Auto-finalize orphan session {session_path.name} "
+                          f"({len(chunks)} chunks, last {int(now - last_chunk)}s ago)",
+                          flush=True)
+                    _finalize_session(session_path)
+        except Exception as e:
+            print(f"Session cleanup error: {e}", flush=True)
+        time.sleep(30)
+
+
+threading.Thread(target=session_cleanup_worker, daemon=True).start()
 
 
 @app.route("/api/upload", methods=["POST"])

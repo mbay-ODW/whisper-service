@@ -702,9 +702,13 @@ async function deleteModel(name) {
 
 loadModels();
 
-// ── Recorder (Browser) ──────────────────────────────────────────────────
+// ── Recorder (Browser) — Streaming-Upload ───────────────────────────────
+// Jeder 2s-Audio-Chunk geht SOFORT zum Server statt am Ende den Blob hochzuladen.
+// Wenn iOS Safari beim App-Switch den Tab kickt, hat der Server alles bis dahin.
+// Server finalisiert verwaiste Sessions nach 5 min ohne neuen Chunk automatisch.
 let mediaRecorder = null;
-let recordChunks = [];
+let recordSession = null;   // server-side session_id
+let recordSeq = 0;
 let recordStartTime = 0;
 let recordTimerInterval = null;
 let recordAudioCtx = null;
@@ -713,7 +717,6 @@ let recordRafId = null;
 let recordStream = null;
 
 function pickAudioMime() {
-  // iOS Safari preferiert mp4, andere webm/opus
   const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/aac'];
   for (const m of candidates) {
     if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return m;
@@ -729,7 +732,8 @@ async function toggleRecord() {
   }
 }
 
-// Wake Lock — verhindert Screen-Sleep während Aufnahme (iOS Safari 16.4+, Chrome, Edge, FF)
+// Wake Lock — verhindert Screen-Sleep solange wir im Vordergrund sind (Apple
+// lässt JS im Hintergrund eh keine Aufnahme machen, aber im Vordergrund hilft das)
 let wakeLock = null;
 async function acquireWakeLock() {
   if (!('wakeLock' in navigator)) return false;
@@ -737,26 +741,18 @@ async function acquireWakeLock() {
     wakeLock = await navigator.wakeLock.request('screen');
     wakeLock.addEventListener('release', () => { wakeLock = null; });
     return true;
-  } catch(e) {
-    console.warn('WakeLock denied:', e);
-    return false;
-  }
+  } catch(e) { return false; }
 }
 async function releaseWakeLock() {
   if (!wakeLock) return;
   try { await wakeLock.release(); } catch(e) {}
   wakeLock = null;
 }
-// Falls Browser doch in den Hintergrund geht, neu anfordern wenn er zurückkommt
 document.addEventListener('visibilitychange', async () => {
   if (document.visibilityState === 'visible' && mediaRecorder?.state === 'recording' && !wakeLock) {
     await acquireWakeLock();
   }
 });
-
-// Erkennung dass die Aufnahme unterbrochen wurde
-let lastChunkTime = 0;
-let recordWatchdog = null;
 
 async function startRecord() {
   if (!navigator.mediaDevices || !window.MediaRecorder) {
@@ -771,30 +767,61 @@ async function startRecord() {
   }
 
   const mime = pickAudioMime();
+  const ext = mime.includes('mp4') || mime.includes('aac') ? 'm4a' : 'webm';
+
+  // 1) Server-Session anlegen
   try {
-    // Timeslice — alle 1000ms Chunk-Callback feuern lassen. So merken wir wenn Stream einfriert.
-    mediaRecorder = new MediaRecorder(recordStream, mime ? {mimeType: mime} : {});
+    const initResp = await apiFetch('/api/record/init', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        mime, ext,
+        model: document.getElementById('model-select').value,
+        initial_prompt: document.getElementById('prompt-input').value,
+        owner: 'memo',
+      }),
+    });
+    const initData = await initResp.json();
+    if (!initResp.ok) throw new Error(initData.error || 'init failed');
+    recordSession = initData.session_id;
+    recordSeq = 0;
   } catch(e) {
-    showToast('Aufnahme nicht möglich: ' + e.message, true);
+    showToast('Server-Session fehlgeschlagen: ' + e.message, true);
     stopStream();
     return;
   }
 
-  recordChunks = [];
-  lastChunkTime = Date.now();
-  mediaRecorder.ondataavailable = e => {
-    if (e.data.size > 0) {
-      recordChunks.push(e.data);
-      lastChunkTime = Date.now();
+  // 2) Recorder mit timeslice=2000ms — alle 2s ein Chunk-Event → SOFORT POST
+  try {
+    mediaRecorder = new MediaRecorder(recordStream, mime ? {mimeType: mime} : {});
+  } catch(e) {
+    showToast('Aufnahme nicht möglich: ' + e.message, true);
+    stopStream();
+    apiFetch(`/api/record/cancel?session_id=${recordSession}`, {method:'POST'}).catch(()=>{});
+    recordSession = null;
+    return;
+  }
+
+  mediaRecorder.ondataavailable = async e => {
+    if (e.data.size === 0 || !recordSession) return;
+    const seq = recordSeq++;
+    try {
+      // keepalive: fetch darf weiterlaufen wenn Page entladen wird (Spec).
+      // Funktioniert in modernen Browsern inkl. iOS Safari 16.4+
+      await fetch(`/api/record/append?session_id=${recordSession}&seq=${seq}`, {
+        method: 'POST',
+        body: e.data,
+        keepalive: true,
+        headers: authHeader,
+      });
+    } catch(err) {
+      console.warn('Chunk ' + seq + ' upload failed:', err);
+      // nicht abbrechen — vlt. klappt der nächste. Server kann gaps tolerieren.
     }
   };
   mediaRecorder.onstop = handleRecordStop;
-  mediaRecorder.onerror = e => {
-    console.error('MediaRecorder error:', e);
-    showToast('Aufnahme-Fehler — bitte stoppen', true);
-  };
-  // Timeslice 1000ms = pro Sekunde ein Chunk-Event. iOS Safari < 16 ignoriert das, andere Browser nutzen es.
-  mediaRecorder.start(1000);
+  mediaRecorder.onerror = e => console.error('MediaRecorder error:', e);
+  mediaRecorder.start(2000);  // 2s pro Chunk
 
   await acquireWakeLock();
 
@@ -802,24 +829,12 @@ async function startRecord() {
   setRecordingUI(true);
   recordTimerInterval = setInterval(updateRecordTimer, 100);
   startLevelMeter();
-
-  // Watchdog: wenn 12s keine Chunks ankommen UND Tab versteckt — Recorder ist eingefroren
-  recordWatchdog = setInterval(() => {
-    if (!mediaRecorder || mediaRecorder.state !== 'recording') return;
-    const stalled = Date.now() - lastChunkTime > 12000;
-    if (stalled && document.visibilityState !== 'visible') {
-      console.warn('Recorder stalled in background — stopping cleanly');
-      showToast('Aufnahme im Hintergrund unterbrochen — speichere bisher Aufgenommenes', true);
-      stopRecord();
-    }
-  }, 4000);
 }
 
 function stopRecord() {
   if (!mediaRecorder) return;
   try { mediaRecorder.stop(); } catch(e) {}
   clearInterval(recordTimerInterval);
-  if (recordWatchdog) { clearInterval(recordWatchdog); recordWatchdog = null; }
   stopLevelMeter();
   releaseWakeLock();
   setRecordingUI(false);
@@ -832,47 +847,43 @@ function stopStream() {
   }
 }
 
-function handleRecordStop() {
-  const mime = mediaRecorder.mimeType || 'audio/webm';
-  const ext = mime.includes('mp4') || mime.includes('aac') ? 'm4a'
-            : mime.includes('webm') ? 'webm'
-            : 'webm';
-  const blob = new Blob(recordChunks, {type: mime});
+async function handleRecordStop() {
   stopStream();
+  const session = recordSession;
   mediaRecorder = null;
+  recordSession = null;
 
-  if (blob.size < 1024) {
-    showToast('Aufnahme zu kurz', true);
-    return;
-  }
-  uploadRecording(blob, ext);
-}
+  if (!session) return;
 
-async function uploadRecording(blob, ext) {
-  const filename = `memo_${new Date().toISOString().replace(/[:.]/g,'-')}.${ext}`;
-  const fd = new FormData();
-  fd.append('files', blob, filename);
-  fd.append('initial_prompt', document.getElementById('prompt-input').value);
-  fd.append('model', document.getElementById('model-select').value);
-
-  const btn = document.getElementById('record-btn');
-  btn.disabled = true;
+  // Kurz warten dass die letzten Chunks ankommen
   document.getElementById('record-status').textContent = 'Lädt hoch…';
+  document.getElementById('record-btn').disabled = true;
+  await new Promise(r => setTimeout(r, 1200));
 
   try {
-    const r = await apiFetch('/api/upload', {method:'POST', body: fd});
+    const r = await apiFetch(`/api/record/finalize?session_id=${session}`, {method:'POST'});
     const d = await r.json();
-    if (!r.ok) throw new Error(d.error || 'Upload fehlgeschlagen');
-    showToast('Aufnahme hochgeladen, Transkription startet');
+    if (!r.ok) throw new Error(d.error || 'Finalize fehlgeschlagen');
+    showToast(`Aufnahme hochgeladen (${d.chunks} Chunks, ${(d.size/1024).toFixed(0)} KB)`);
     refreshJobs();
   } catch(e) {
-    showToast('Fehler: ' + e.message, true);
+    showToast('Fehler: ' + e.message + ' — Server-Auto-Finalize läuft in 5min', true);
   } finally {
-    btn.disabled = false;
+    document.getElementById('record-btn').disabled = false;
     document.getElementById('record-status').textContent = 'Tippen zum Aufnehmen';
     document.getElementById('record-timer').textContent = '00:00';
   }
 }
+
+// Beim Schließen des Tabs versuchen wir noch zu finalisieren — beste Mühe, kein Garantie
+window.addEventListener('pagehide', () => {
+  if (recordSession) {
+    // sendBeacon ist die einzige Methode die beim Unload garantiert noch losgeht
+    try {
+      navigator.sendBeacon(`/api/record/finalize?session_id=${recordSession}`, new Blob([]));
+    } catch(e) {}
+  }
+});
 
 function setRecordingUI(rec) {
   document.getElementById('record-btn').classList.toggle('recording', rec);
