@@ -82,10 +82,12 @@ Nimm Sprachmemos auf, lass sie automatisch per [faster-whisper](https://github.c
 | Router | Pfad | Middleware-Chain | Zweck |
 |---|---|---|---|
 | `whisper-public` | `/health`, `/api/config` | `rate-limit` | Reachability-Probes, App-Setup |
-| `whisper-api` | `PathPrefix(/api)` | `rate-limit` | Flask validiert Bearer-Token selbst |
+| `whisper-api` | `PathPrefix(/api)` | `rate-limit` → `strip-remote-user` | Flask validiert Bearer-Token selbst |
 | `whisper-ui` | alles andere | `rate-limit` → `authelia` | Browser-Session via Cookie |
 
 Beim ersten Aufruf von `GET /` setzt Flask anhand des `Remote-User`-Headers eine signierte Session-Cookie. AJAX-Requests an `/api/*` (kein Authelia auf der Route!) authentifizieren sich dann via Cookie. iOS-Clients senden stattdessen `Authorization: Bearer <token>`.
+
+**`strip-remote-user` auf `whisper-api` ist nicht optional.** Auf dieser Route läuft keine ForwardAuth, die den Header setzen und damit einen mitgeschickten überschreiben würde — ohne die Middleware ist `Remote-User` reine Client-Eingabe. Die App weigert sich zusätzlich, den Header unterhalb von `/api` überhaupt zu lesen (`proxy_user()`), sodass eine vergessene Middleware allein die Authentifizierung nicht aushebelt.
 
 ---
 
@@ -159,7 +161,7 @@ Beim ersten Start: Server-URL eintragen + den eben erstellten App-Token einfüge
 | Variable | Default | Bedeutung |
 |---|---|---|
 | `WHISPER_MODEL` | `large-v3` | Default-Modell; pro Job überschreibbar |
-| `TRUST_PROXY_AUTH` | `true` | `Remote-User`/`X-Forwarded-User` als Auth akzeptieren |
+| `TRUST_PROXY_AUTH` | `true` | `Remote-User`/`X-Forwarded-User` als Auth akzeptieren — **nur außerhalb von `/api`**, siehe `proxy_user()` |
 | `FLASK_SECRET_KEY` | random | Persistente Session-Cookies über Restarts hinweg |
 | `MAX_UPLOAD_MB` | `2048` | Hartes Upload-Limit (413 bei Überschreitung) |
 
@@ -181,6 +183,19 @@ Beispiel-File-Provider (`whisper.yml`):
 
 ```yaml
 http:
+  middlewares:
+    # Pflicht: whisper-api laeuft ohne ForwardAuth, ein mitgeschickter
+    # Remote-User wuerde also unveraendert bei Flask ankommen.
+    # Leerer Wert = Header entfernen.
+    whisper-strip-remote-user:
+      headers:
+        customRequestHeaders:
+          Remote-User: ""
+          Remote-Groups: ""
+          Remote-Name: ""
+          Remote-Email: ""
+          X-Forwarded-User: ""
+
   routers:
     whisper-public:
       rule: "Host(`whisper.example.com`) && (Path(`/health`) || Path(`/api/config`))"
@@ -194,7 +209,7 @@ http:
       rule: "Host(`whisper.example.com`) && PathPrefix(`/api`)"
       entrypoints: [websecure]
       service: whisper-svc
-      middlewares: [middlewares-rate-limit]
+      middlewares: [middlewares-rate-limit, whisper-strip-remote-user]
       priority: 20
       tls: {}
 

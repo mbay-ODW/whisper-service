@@ -97,11 +97,28 @@ job_queue = queue.Queue()
 DEFAULT_PROMPT = ""
 
 
+def proxy_user(req):
+    """The Authelia-authenticated user, or None.
+
+    Remote-User only means anything on paths whose Traefik router runs Authelia's
+    forward-auth: there the proxy sets the header itself, overwriting whatever the
+    client sent. The /api/* router deliberately has no forward-auth (Bearer tokens
+    instead), so on those paths the header is plain client input -- a caller could
+    otherwise authenticate itself just by sending it. Traefik strips it there as
+    well, but this deliberately does not depend on that: a proxy rule is one edit
+    away from being lost, and authentication must not be what silently disappears
+    with it.
+
+    The prefix mirrors the router rule PathPrefix(`/api`) one-to-one on purpose.
+    """
+    if req.path.startswith("/api"):
+        return None
+    return req.headers.get("Remote-User") or req.headers.get("X-Forwarded-User")
+
+
 def check_auth(req) -> bool:
-    # Authelia sets Remote-User on routes going through whisper-ui router
-    if TRUST_PROXY_AUTH:
-        if req.headers.get("Remote-User") or req.headers.get("X-Forwarded-User"):
-            return True
+    if TRUST_PROXY_AUTH and proxy_user(req):
+        return True
 
     # Flask session cookie — set when browser loads GET / through Authelia.
     # Allows browser AJAX calls to /api/* (whisper-api router, no Authelia) to
@@ -122,9 +139,8 @@ def check_auth(req) -> bool:
 
 def is_browser_auth(req) -> bool:
     """True if request came through Authelia or has a browser session cookie."""
-    if TRUST_PROXY_AUTH:
-        if req.headers.get("Remote-User") or req.headers.get("X-Forwarded-User"):
-            return True
+    if TRUST_PROXY_AUTH and proxy_user(req):
+        return True
     return bool(session.get("authenticated"))
 
 
@@ -372,7 +388,7 @@ def index():
     # When Authelia authenticates the browser, set a session cookie so that
     # AJAX calls to /api/* (whisper-api router, no Authelia middleware) also
     # get authenticated via Flask session instead of Remote-User header.
-    if request.headers.get("Remote-User") or request.headers.get("X-Forwarded-User"):
+    if proxy_user(request):
         session["authenticated"] = True
     return render_template("index.html", default_prompt=DEFAULT_PROMPT, current_model=WHISPER_MODEL)
 
