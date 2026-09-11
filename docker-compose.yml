@@ -10,7 +10,11 @@ services:
       - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-2048}
     volumes:
       - whisper_models:/model_cache
-      - whisper_transcripts:/transcripts
+      # Bind-Mount statt Named Volume: /mnt/.ix-apps/docker/volumes liegt im
+      # ix-apps-Interna-Bereich — nicht im Backup-Scope und weg, wenn der
+      # Apps-Pool neu initialisiert wird. Transkripte sind die einzigen
+      # unersetzlichen Daten hier; der Modell-Cache bleibt regenerierbar.
+      - /mnt/apps/whisper/transcripts:/transcripts
     networks:
       - traefik
     labels:
@@ -47,4 +51,3 @@ networks:
 
 volumes:
   whisper_models:
-  whisper_transcripts:
