@@ -27,7 +27,7 @@ app.config["MAX_CONTENT_LENGTH"] = _max_mb * 1024 * 1024
 
 TRUST_PROXY_AUTH = os.environ.get("TRUST_PROXY_AUTH", "true").lower() == "true"
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
-TRANSCRIPTS_DIR = Path("/transcripts")
+TRANSCRIPTS_DIR = Path(os.environ.get("TRANSCRIPTS_DIR", "/transcripts"))
 MODEL_CACHE_DIR = Path("/model_cache")
 TOKENS_FILE = TRANSCRIPTS_DIR / ".tokens.json"
 MODELS_FILE = TRANSCRIPTS_DIR / ".models.json"
@@ -86,6 +86,87 @@ ALLOWED_EXTENSIONS = {"m4a", "mp3", "wav", "ogg", "flac", "webm", "mp4"}
 # Job store: id -> dict
 jobs = OrderedDict()
 jobs_lock = threading.Lock()
+
+
+def _transcript_job_id(filename: str) -> str:
+    """Deterministic job id for a transcript file.
+
+    Derived from the filename instead of random, so a restored job keeps the
+    same id across restarts — links and MCP job references stay valid.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"whisper-transcript:{filename}"))
+
+
+def read_transcript(job) -> str:
+    """Transcript text for a job, read from disk if it is not in memory.
+
+    Restored jobs carry only the path; the text stays on disk until someone
+    actually asks for it.
+    """
+    cached = job.get("full_text")
+    if cached is not None:
+        return cached
+    path = job.get("transcript_file", "")
+    if not path:
+        return ""
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _rehydrate_jobs() -> None:
+    """Rebuild the job index from the transcripts on disk.
+
+    The job store lives in memory, so every container restart used to orphan
+    the whole archive: the .txt files stayed in TRANSCRIPTS_DIR but nothing
+    listed them any more. transcribe_job() writes them as
+    ``<date>_<time>_<original stem>.txt``, which carries everything we need
+    except the text itself — that is read on demand by read_transcript().
+
+    Sorted ascending so the OrderedDict keeps its oldest-first invariant;
+    list_jobs() reverses it for display.
+    """
+    restored = 0
+    for path in sorted(TRANSCRIPTS_DIR.glob("*.txt")):
+        if path.name.startswith("."):
+            continue  # our own state files (.tokens.json etc.)
+        try:
+            if path.stat().st_size == 0:
+                continue  # aborted recording, nothing to show
+        except OSError:
+            continue
+        parts = path.stem.split("_", 2)
+        if len(parts) != 3:
+            continue  # not one of ours
+        date_str, time_str, original_name = parts
+        try:
+            created = datetime.strptime(
+                f"{date_str}_{time_str}", "%Y-%m-%d_%H-%M-%S"
+            ).timestamp()
+        except ValueError:
+            created = path.stat().st_mtime
+        job_id = _transcript_job_id(path.name)
+        jobs[job_id] = {
+            "id": job_id,
+            "status": "done",
+            "progress": 100,
+            "original_filename": original_name,
+            "file_path": "",          # source audio is long gone
+            "transcript_file": str(path),
+            "created_at": created,
+            "finished_at": created,
+            "segments": [],           # only the plain text survived
+            "full_text": None,        # lazy, see read_transcript()
+            "error": None,
+            "cancelled": False,
+            "restored": True,
+        }
+        restored += 1
+    print(f"Rehydrated {restored} transcript(s) from {TRANSCRIPTS_DIR}", flush=True)
+
+
+_rehydrate_jobs()
 
 # Worker queue
 import queue
@@ -768,9 +849,10 @@ def get_job(job_id):
         "finished_at": job.get("finished_at"),
         "error": job.get("error"),
         "segments": job.get("segments", []),
-        "full_text": job.get("full_text", ""),
+        "full_text": read_transcript(job),
         "duration": job.get("duration"),
         "language": job.get("language"),
+        "restored": job.get("restored", False),
     })
 
 
@@ -823,6 +905,14 @@ def delete_job(job_id):
             os.remove(file_path)
         except Exception:
             pass
+    # Also drop the transcript. Without this the job would reappear on the next
+    # restart, because _rehydrate_jobs() rebuilds the index from these files.
+    transcript_file = job.get("transcript_file", "")
+    if transcript_file and os.path.exists(transcript_file):
+        try:
+            os.remove(transcript_file)
+        except Exception:
+            pass
     return jsonify({"ok": True})
 
 
@@ -868,6 +958,53 @@ def api_transcribe():
     return jsonify({"job_id": job_id, "status": "queued"}), 202
 
 
+@app.route("/api/transcripts/search")
+def search_transcripts():
+    """Full-text search straight over the files on disk.
+
+    Deliberately independent of the in-memory job index: the transcripts are
+    the durable artefact, the index is derived from them.
+    """
+    query = (request.args.get("q") or "").strip().lower()
+    if not query:
+        return jsonify([])
+    try:
+        limit = max(1, min(int(request.args.get("limit", 20)), 200))
+    except (TypeError, ValueError):
+        limit = 20
+
+    # Newest first — filenames start with the timestamp.
+    with jobs_lock:
+        by_path = {j.get("transcript_file"): j["id"] for j in jobs.values()}
+
+    results = []
+    for path in sorted(TRANSCRIPTS_DIR.glob("*.txt"), reverse=True):
+        if len(results) >= limit:
+            break
+        if path.name.startswith("."):
+            continue
+        try:
+            if path.stat().st_size == 0:
+                continue
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        idx = text.lower().find(query)
+        if idx < 0:
+            continue
+        start = max(0, idx - 120)
+        end = min(len(text), idx + len(query) + 120)
+        results.append({
+            "id": by_path.get(str(path)) or _transcript_job_id(path.name),
+            "filename": path.name,
+            "created_at": path.stat().st_mtime,
+            "snippet": ("…" if start > 0 else "")
+            + text[start:end].strip()
+            + ("…" if end < len(text) else ""),
+        })
+    return jsonify(results)
+
+
 @app.route("/api/download/<job_id>/<fmt>")
 def download_result(job_id, fmt):
     with jobs_lock:
@@ -876,7 +1013,7 @@ def download_result(job_id, fmt):
         return jsonify({"error": "Not ready"}), 404
 
     segments = job.get("segments", [])
-    full_text = job.get("full_text", "")
+    full_text = read_transcript(job)
     base_name = Path(job["original_filename"]).stem
 
     if fmt == "txt":
