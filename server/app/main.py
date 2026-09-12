@@ -151,9 +151,11 @@ def m4a_for(source: str) -> Path:
 
     tmp = target.with_suffix(".m4a.part")
     subprocess.run(
+        # -f ipod is required, not cosmetic: the temporary name ends in .part,
+        # and ffmpeg picks the muxer from the extension unless told otherwise.
         ["ffmpeg", "-nostdin", "-y", "-i", source,
          "-vn", "-ac", "1", "-c:a", "aac", "-b:a", "64k",
-         "-movflags", "+faststart", str(tmp)],
+         "-movflags", "+faststart", "-f", "ipod", str(tmp)],
         check=True, capture_output=True,
     )
     tmp.replace(target)
