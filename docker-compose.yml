@@ -8,6 +8,15 @@ services:
       - TRUST_PROXY_AUTH=${TRUST_PROXY_AUTH:-true}
       - FLASK_SECRET_KEY=${FLASK_SECRET_KEY:-}
       - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-2048}
+      # Aufnahmen von vor der Mehrbenutzer-Umstellung gehören diesem Konto —
+      # das gilt auch für Alt-Tokens, die noch keinen Besitzer tragen.
+      - DEFAULT_OWNER=${DEFAULT_OWNER:-murat}
+      # Introspection, damit auch API-Clients (iOS-App) eine Identität haben.
+      # Nutzt bewusst den vorhandenen whisper-mcp-Client: ein eigener Authelia-
+      # Client wäre sauberer, hieße aber die Authelia-Konfiguration anfassen.
+      - OIDC_INTROSPECTION_URL=${OIDC_INTROSPECTION_URL:-https://authelia.bay-ram.de/api/oidc/introspection}
+      - OIDC_CLIENT_ID=whisper-mcp
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET}
     volumes:
       - whisper_models:/model_cache
       # Bind-Mount statt Named Volume: /mnt/.ix-apps/docker/volumes liegt im

@@ -1,4 +1,5 @@
 import os
+import re
 import glob
 import uuid
 import json
@@ -8,6 +9,7 @@ import subprocess
 import tempfile
 import shutil
 import secrets
+import requests
 from pathlib import Path
 from datetime import datetime
 from collections import OrderedDict
@@ -33,17 +35,31 @@ TRANSCRIPTS_DIR = Path(os.environ.get("TRANSCRIPTS_DIR", "/transcripts"))
 # retention job. Separate mount from the transcripts so the bulky part can be
 # backed up, moved or cleared on its own.
 AUDIO_DIR = Path(os.environ.get("AUDIO_DIR", "/audio"))
-# Converted copies live in a subdirectory, not beside the originals: find_audio()
-# globs AUDIO_DIR by stem and would otherwise pair a recording with its own
-# conversion. Dot-prefixed because it is derived data, not an archive.
-M4A_CACHE_DIR = AUDIO_DIR / ".m4a"
+
+# Everything a user owns lives under <base>/<username>/. Directories rather than
+# an ownership table: the layout is self-describing, survives the index being
+# rebuilt from disk, and makes per-person backup or removal a plain `mv`.
+# Recordings that predate multi-user belong to this account.
+DEFAULT_OWNER_RAW = os.environ.get("DEFAULT_OWNER", "murat")
+
+# Authelia identifies browsers by header and API clients by token. Both have to
+# resolve to the same string or one person ends up with two directories.
+OIDC_INTROSPECTION_URL = os.environ.get("OIDC_INTROSPECTION_URL", "")
+OIDC_CLIENT_ID = os.environ.get("OIDC_CLIENT_ID", "")
+OIDC_CLIENT_SECRET = os.environ.get("OIDC_CLIENT_SECRET", "")
+OIDC_CACHE_TTL = int(os.environ.get("OIDC_CACHE_TTL", "60"))
+_oidc_cache: dict = {}
+_oidc_lock = threading.Lock()
+
+_UNSAFE_IN_USERNAME = re.compile(r"[^a-z0-9._-]")
+
 MODEL_CACHE_DIR = Path("/model_cache")
 TOKENS_FILE = TRANSCRIPTS_DIR / ".tokens.json"
 MODELS_FILE = TRANSCRIPTS_DIR / ".models.json"
 SESSIONS_DIR = TRANSCRIPTS_DIR / ".recording-sessions"
 TRANSCRIPTS_DIR.mkdir(exist_ok=True)
 AUDIO_DIR.mkdir(exist_ok=True)
-M4A_CACHE_DIR.mkdir(exist_ok=True)
+
 SESSIONS_DIR.mkdir(exist_ok=True)
 
 # Built-in models always available (downloaded by faster-whisper on demand)
@@ -56,6 +72,92 @@ SESSION_AUTO_FINALIZE_AFTER = int(os.environ.get("SESSION_AUTO_FINALIZE_AFTER", 
 _tokens_lock = threading.Lock()
 _models_lock = threading.Lock()
 _sessions_lock = threading.Lock()
+
+
+# Transliterated before stripping, so "Müller" becomes "mueller" rather than
+# the "m-ller" that a blunt substitution would leave behind.
+_UMLAUTS = {"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss"}
+
+
+def normalize_user(name):
+    """A username reduced to something safe to use as a directory name."""
+    if not name:
+        return None
+    lowered = str(name).strip().lower()
+    for umlaut, replacement in _UMLAUTS.items():
+        lowered = lowered.replace(umlaut, replacement)
+    cleaned = _UNSAFE_IN_USERNAME.sub("-", lowered).strip("-.")
+    return cleaned[:64] or None
+
+
+DEFAULT_OWNER = normalize_user(DEFAULT_OWNER_RAW) or "unknown"
+
+
+def user_dir(base: Path, user: str) -> Path:
+    """The user's directory under `base`, created on first use.
+
+    Created lazily rather than provisioned up front: a family member exists here
+    the moment they first log in through Authelia, and nowhere before that.
+    """
+    d = base / user
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def m4a_cache_dir(user: str) -> Path:
+    return user_dir(AUDIO_DIR / user, ".m4a")
+
+
+def oidc_user(token: str):
+    """Username behind an Authelia access token, or None.
+
+    Cached for a minute: the job list polls every two seconds, and introspecting
+    every one of those against Authelia would be slow and impolite.
+    """
+    if not (OIDC_INTROSPECTION_URL and OIDC_CLIENT_ID and OIDC_CLIENT_SECRET):
+        return None
+    now = time.time()
+    with _oidc_lock:
+        cached = _oidc_cache.get(token)
+        if cached and cached[1] > now:
+            return cached[0]
+
+    user = None
+    try:
+        resp = requests.post(
+            OIDC_INTROSPECTION_URL,
+            data={"token": token},
+            auth=(OIDC_CLIENT_ID, OIDC_CLIENT_SECRET),
+            timeout=5,
+        )
+        data = resp.json()
+        if data.get("active"):
+            # Authelia's `sub` is an opaque uuid, while the browser is known by
+            # its username in Remote-User. Prefer the readable claims so both
+            # routes land on the same directory.
+            user = normalize_user(
+                data.get("preferred_username") or data.get("username") or data.get("sub")
+            )
+            print(f"OIDC token resolved to user {user!r}", flush=True)
+    except Exception as e:
+        print(f"OIDC introspection failed: {e}", flush=True)
+
+    with _oidc_lock:
+        _oidc_cache[token] = (user, now + OIDC_CACHE_TTL)
+    return user
+
+
+def token_owner(value):
+    """Owner recorded for a static token.
+
+    Entries used to be plain ``{token: label}`` strings, from before tokens had
+    an owner. Those predate multi-user and therefore belong to DEFAULT_OWNER —
+    which is also what keeps the MCP server working without touching the
+    secrets file.
+    """
+    if isinstance(value, dict):
+        return normalize_user(value.get("owner")) or DEFAULT_OWNER
+    return DEFAULT_OWNER
 
 
 def _load_tokens() -> dict:
@@ -145,7 +247,7 @@ def m4a_for(source: str) -> Path:
     Written to a temp name and renamed into place, so an interrupted conversion
     cannot leave a truncated file that later downloads would happily serve.
     """
-    target = M4A_CACHE_DIR / (Path(source).stem + ".m4a")
+    target = m4a_cache_dir(Path(source).parent.name) / (Path(source).stem + ".m4a")
     if target.exists() and target.stat().st_size > 0:
         return target
 
@@ -166,7 +268,7 @@ def drop_m4a_cache(source: str) -> None:
     """Remove the converted copy belonging to a recording."""
     if not source:
         return
-    cached = M4A_CACHE_DIR / (Path(source).stem + ".m4a")
+    cached = m4a_cache_dir(Path(source).parent.name) / (Path(source).stem + ".m4a")
     for leftover in (cached, cached.with_suffix(".m4a.part")):
         try:
             leftover.unlink()
@@ -174,13 +276,13 @@ def drop_m4a_cache(source: str) -> None:
             pass
 
 
-def find_audio(stem: str):
+def find_audio(user: str, stem: str):
     """The archived recording belonging to a transcript stem, if it is still there.
 
     Transcript and recording share a base name and differ only in the
     extension, which depends on what the client uploaded.
     """
-    for candidate in AUDIO_DIR.glob(f"{glob.escape(stem)}.*"):
+    for candidate in (AUDIO_DIR / user).glob(f"{glob.escape(stem)}.*"):
         if candidate.is_file():
             return candidate
     return None
@@ -216,45 +318,67 @@ def _rehydrate_jobs() -> None:
     Sorted ascending so the OrderedDict keeps its oldest-first invariant;
     list_jobs() reverses it for display.
     """
+    stray = list(TRANSCRIPTS_DIR.glob("*.txt"))
+    if stray:
+        # Loose files mean the per-user migration missed something. Loud, and
+        # deliberately not adopted into an account: guessing an owner is how one
+        # person's recording ends up in someone else's list.
+        print(f"WARNING: {len(stray)} transcript(s) sit directly in "
+              f"{TRANSCRIPTS_DIR} and belong to no user — ignored", flush=True)
+
     restored = 0
-    for path in sorted(TRANSCRIPTS_DIR.glob("*.txt")):
-        if path.name.startswith("."):
-            continue  # our own state files (.tokens.json etc.)
-        try:
-            if path.stat().st_size == 0:
-                continue  # aborted recording, nothing to show
-        except OSError:
-            continue
-        parts = path.stem.split("_", 2)
-        if len(parts) != 3:
-            continue  # not one of ours
-        date_str, time_str, original_name = parts
-        try:
-            created = datetime.strptime(
-                f"{date_str}_{time_str}", "%Y-%m-%d_%H-%M-%S"
-            ).timestamp()
-        except ValueError:
-            created = path.stat().st_mtime
-        job_id = _transcript_job_id(path.name)
-        audio = find_audio(path.stem)
-        jobs[job_id] = {
-            "id": job_id,
-            "status": "done",
-            "progress": 100,
-            "original_filename": original_name,
-            "file_path": "",          # source audio is long gone
-            "transcript_file": str(path),
-            "audio_file": str(audio) if audio else "",
-            "created_at": created,
-            "finished_at": created,
-            "segments": [],           # only the plain text survived
-            "full_text": None,        # lazy, see read_transcript()
-            "error": None,
-            "cancelled": False,
-            "restored": True,
-        }
-        restored += 1
-    print(f"Rehydrated {restored} transcript(s) from {TRANSCRIPTS_DIR}", flush=True)
+    per_user = {}
+    for user_path in sorted(TRANSCRIPTS_DIR.iterdir()):
+        if not user_path.is_dir() or user_path.name.startswith("."):
+            continue  # .recording-sessions and friends
+        owner = user_path.name
+        for path in sorted(user_path.glob("*.txt")):
+            if path.name.startswith("."):
+                continue
+            try:
+                if path.stat().st_size == 0:
+                    continue  # aborted recording, nothing to show
+            except OSError:
+                continue
+            parts = path.stem.split("_", 2)
+            if len(parts) != 3:
+                continue  # not one of ours
+            date_str, time_str, original_name = parts
+            try:
+                created = datetime.strptime(
+                    f"{date_str}_{time_str}", "%Y-%m-%d_%H-%M-%S"
+                ).timestamp()
+            except ValueError:
+                created = path.stat().st_mtime
+            job_id = _transcript_job_id(f"{owner}/{path.name}")
+            audio = find_audio(owner, path.stem)
+            jobs[job_id] = {
+                "id": job_id,
+                "user": owner,
+                "status": "done",
+                "progress": 100,
+                "original_filename": original_name,
+                "file_path": "",          # source audio is long gone
+                "transcript_file": str(path),
+                "audio_file": str(audio) if audio else "",
+                "created_at": created,
+                "finished_at": created,
+                "segments": [],           # only the plain text survived
+                "full_text": None,        # lazy, see read_transcript()
+                "error": None,
+                "cancelled": False,
+                "restored": True,
+            }
+            restored += 1
+            per_user[owner] = per_user.get(owner, 0) + 1
+
+    # Oldest first across all users, so list_jobs() can keep reversing the dict.
+    ordered = sorted(jobs.items(), key=lambda kv: kv[1]["created_at"])
+    jobs.clear()
+    jobs.update(ordered)
+
+    summary = ", ".join(f"{u}: {n}" for u, n in sorted(per_user.items())) or "none"
+    print(f"Rehydrated {restored} transcript(s) ({summary})", flush=True)
 
 
 _rehydrate_jobs()
@@ -288,25 +412,41 @@ def proxy_user(req):
     return req.headers.get("Remote-User") or req.headers.get("X-Forwarded-User")
 
 
-def check_auth(req) -> bool:
-    if TRUST_PROXY_AUTH and proxy_user(req):
-        return True
+def current_user(req):
+    """Who is making this request, or None if nobody is authenticated.
 
-    # Flask session cookie — set when browser loads GET / through Authelia.
-    # Allows browser AJAX calls to /api/* (whisper-api router, no Authelia) to
-    # authenticate without re-checking Authelia on every request.
-    if session.get("authenticated"):
-        return True
+    Four routes to the same answer: Authelia's header on the non-/api paths, the
+    session cookie that GET / leaves behind for the /api calls that follow, a
+    static token that carries its owner, or an Authelia access token that gets
+    introspected.
 
-    # iOS / API clients: Bearer token from static token list
+    A session from before ownership existed carries no user. It is treated as
+    unauthenticated rather than guessed at — reloading the page goes through
+    Authelia and issues a proper one. Guessing here would hand one person's
+    recordings to whoever still had an old cookie.
+    """
+    proxied = normalize_user(proxy_user(req))
+    if TRUST_PROXY_AUTH and proxied:
+        return proxied
+
+    from_session = session.get("user")
+    if from_session:
+        return from_session
+
     auth_header = req.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
         with _tokens_lock:
             tokens = _load_tokens()
-        return token in tokens
+        if token in tokens:
+            return token_owner(tokens[token])
+        return oidc_user(token)
 
-    return False
+    return None
+
+
+def check_auth(req) -> bool:
+    return current_user(req) is not None
 
 
 def is_browser_auth(req) -> bool:
@@ -487,7 +627,8 @@ def transcribe_job(job_id: str):
         date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         original_name = Path(job["original_filename"]).stem
         txt_filename = f"{date_str}_{original_name}.txt"
-        txt_path = TRANSCRIPTS_DIR / txt_filename
+        owner = job.get("user") or DEFAULT_OWNER
+        txt_path = user_dir(TRANSCRIPTS_DIR, owner) / txt_filename
         txt_path.write_text(full_text, encoding="utf-8")
 
         # Keep the recording. Same base name as the transcript so the two are
@@ -496,7 +637,7 @@ def transcribe_job(job_id: str):
         source_audio = job.get("file_path", "")
         if source_audio and os.path.exists(source_audio):
             suffix = Path(job["original_filename"]).suffix or Path(source_audio).suffix
-            candidate = AUDIO_DIR / f"{date_str}_{original_name}{suffix}"
+            candidate = user_dir(AUDIO_DIR, owner) / f"{date_str}_{original_name}{suffix}"
             try:
                 shutil.move(source_audio, candidate)
                 audio_path = candidate
@@ -573,11 +714,17 @@ def request_too_large(_):
 
 @app.route("/")
 def index():
-    # When Authelia authenticates the browser, set a session cookie so that
-    # AJAX calls to /api/* (whisper-api router, no Authelia middleware) also
-    # get authenticated via Flask session instead of Remote-User header.
-    if proxy_user(request):
+    # When Authelia authenticates the browser, remember who it is. The /api/*
+    # router runs no forward-auth, so this session cookie is the only place the
+    # identity survives for the AJAX calls that follow. This is also the single
+    # moment a new family member comes into existence here: their directories
+    # are created on their first visit, nothing has to be provisioned.
+    user = normalize_user(proxy_user(request))
+    if user:
         session["authenticated"] = True
+        session["user"] = user
+        user_dir(TRANSCRIPTS_DIR, user)
+        user_dir(AUDIO_DIR, user)
     return render_template("index.html", default_prompt=DEFAULT_PROMPT, current_model=WHISPER_MODEL)
 
 
@@ -586,6 +733,8 @@ def api_config():
     return jsonify({
         "model_default": WHISPER_MODEL,
         "models": _all_models(),
+        # Public endpoint, so this is None until Authelia has been through.
+        "user": current_user(request),
     })
 
 
@@ -638,9 +787,14 @@ def delete_model(name):
 def list_tokens():
     if not is_browser_auth(request):
         abort(403)
+    user = current_user(request)
     with _tokens_lock:
         tokens = _load_tokens()
-    return jsonify([{"id": tid, "name": name} for tid, name in tokens.items()])
+    return jsonify([
+        {"id": tid, "name": value.get("name") if isinstance(value, dict) else value}
+        for tid, value in tokens.items()
+        if token_owner(value) == user
+    ])
 
 
 @app.route("/tokens/create", methods=["POST"])
@@ -654,7 +808,8 @@ def create_token():
     token_value = str(uuid.uuid4()).replace("-", "") + str(uuid.uuid4()).replace("-", "")
     with _tokens_lock:
         tokens = _load_tokens()
-        tokens[token_value] = name
+        # A token can only ever reach the data of whoever created it.
+        tokens[token_value] = {"name": name, "owner": current_user(request)}
         _save_tokens(tokens)
     return jsonify({"name": name, "token": token_value}), 201
 
@@ -663,9 +818,10 @@ def create_token():
 def delete_token(token_value):
     if not is_browser_auth(request):
         abort(403)
+    user = current_user(request)
     with _tokens_lock:
         tokens = _load_tokens()
-        if token_value not in tokens:
+        if token_value not in tokens or token_owner(tokens[token_value]) != user:
             return jsonify({"error": "Not found"}), 404
         del tokens[token_value]
         _save_tokens(tokens)
@@ -694,10 +850,24 @@ def model_status():
 # automatisch nach SESSION_AUTO_FINALIZE_AFTER Sekunden ohne neuen Chunk.
 
 
-def _create_job_from_file(filename: str, file_path: str, initial_prompt: str, model_name: str) -> str:
+def owned_job(job_id: str, user: str):
+    """A job, but only if it belongs to `user`.
+
+    Callers turn a None into 404, never 403: a "forbidden" would confirm that
+    the job exists, which is exactly what someone probing ids wants to know.
+    """
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job or job.get("user") != user:
+        return None
+    return job
+
+
+def _create_job_from_file(filename: str, file_path: str, initial_prompt: str,
+                          model_name: str, user: str) -> str:
     job_id = str(uuid.uuid4())
     job = {
-        "id": job_id, "status": "queued", "progress": 0,
+        "id": job_id, "user": user, "status": "queued", "progress": 0,
         "original_filename": filename, "file_path": file_path,
         "initial_prompt": initial_prompt, "model": model_name,
         "created_at": time.time(), "segments": [], "full_text": "",
@@ -738,6 +908,7 @@ def _finalize_session(session_path: Path) -> dict:
         file_path=str(dest),
         initial_prompt=meta.get("initial_prompt", DEFAULT_PROMPT),
         model_name=meta.get("model", WHISPER_MODEL),
+        user=meta.get("user") or DEFAULT_OWNER,
     )
     return {"job_id": job_id, "chunks": len(chunks), "size": total_size}
 
@@ -758,7 +929,10 @@ def record_init():
         "ext": ext,
         "model": data.get("model", WHISPER_MODEL),
         "initial_prompt": data.get("initial_prompt", DEFAULT_PROMPT),
+        # `owner` is a client-supplied filename prefix and has nothing to do
+        # with ownership; `user` is who this recording will belong to.
         "owner": (data.get("owner") or "memo")[:50],
+        "user": current_user(request) or DEFAULT_OWNER,
     }
     (session_path / "meta.json").write_text(json.dumps(meta))
     return jsonify({"session_id": session_id}), 201
@@ -878,6 +1052,7 @@ def upload():
 
     initial_prompt = request.form.get("initial_prompt", DEFAULT_PROMPT)
     model_name = request.form.get("model", WHISPER_MODEL)
+    uploader = current_user(request) or DEFAULT_OWNER
 
     created_jobs = []
     upload_dir = Path(tempfile.mkdtemp(prefix="whisper_upload_"))
@@ -896,6 +1071,7 @@ def upload():
 
         job = {
             "id": job_id,
+            "user": uploader,
             "status": "queued",
             "progress": 0,
             "original_filename": f.filename,
@@ -923,9 +1099,12 @@ def upload():
 
 @app.route("/api/jobs")
 def list_jobs():
+    user = current_user(request)
     with jobs_lock:
         result = []
         for job in reversed(list(jobs.values())):
+            if job.get("user") != user:
+                continue
             result.append({
                 "id": job["id"],
                 "status": job["status"],
@@ -943,8 +1122,7 @@ def list_jobs():
 
 @app.route("/api/jobs/<job_id>")
 def get_job(job_id):
-    with jobs_lock:
-        job = jobs.get(job_id)
+    job = owned_job(job_id, current_user(request))
     if not job:
         return jsonify({"error": "Not found"}), 404
     return jsonify({
@@ -967,6 +1145,8 @@ def get_job(job_id):
 
 @app.route("/api/jobs/<job_id>/cancel", methods=["POST"])
 def cancel_job(job_id):
+    if not owned_job(job_id, current_user(request)):
+        return jsonify({"error": "Not found"}), 404
     with jobs_lock:
         job = jobs.get(job_id)
         if not job:
@@ -980,6 +1160,8 @@ def cancel_job(job_id):
 
 @app.route("/api/jobs/<job_id>/retry", methods=["POST"])
 def retry_job(job_id):
+    if not owned_job(job_id, current_user(request)):
+        return jsonify({"error": "Not found"}), 404
     with jobs_lock:
         job = jobs.get(job_id)
         if not job:
@@ -1004,6 +1186,8 @@ def retry_job(job_id):
 
 @app.route("/api/jobs/<job_id>/delete", methods=["DELETE"])
 def delete_job(job_id):
+    if not owned_job(job_id, current_user(request)):
+        return jsonify({"error": "Not found"}), 404
     with jobs_lock:
         job = jobs.pop(job_id, None)
     if not job:
@@ -1054,6 +1238,7 @@ def api_transcribe():
 
     job = {
         "id": job_id,
+        "user": current_user(request) or DEFAULT_OWNER,
         "status": "queued",
         "progress": 0,
         "original_filename": f.filename,
@@ -1081,8 +1266,7 @@ def get_audio(job_id):
     conditional=True makes Flask honour Range requests, without which a player
     can only play straight through and cannot seek.
     """
-    with jobs_lock:
-        job = jobs.get(job_id)
+    job = owned_job(job_id, current_user(request))
     if not job:
         return jsonify({"error": "Not found"}), 404
     audio_file = job.get("audio_file", "")
@@ -1120,6 +1304,8 @@ def delete_audio(job_id):
     The recording is the bulky half; the text is usually worth keeping. There
     is no automatic retention — this only ever runs when someone asks for it.
     """
+    if not owned_job(job_id, current_user(request)):
+        return jsonify({"error": "Not found"}), 404
     with jobs_lock:
         job = jobs.get(job_id)
         if not job:
@@ -1142,6 +1328,7 @@ def search_transcripts():
     Deliberately independent of the in-memory job index: the transcripts are
     the durable artefact, the index is derived from them.
     """
+    user = current_user(request)
     query = (request.args.get("q") or "").strip().lower()
     if not query:
         return jsonify([])
@@ -1155,7 +1342,7 @@ def search_transcripts():
         by_path = {j.get("transcript_file"): j["id"] for j in jobs.values()}
 
     results = []
-    for path in sorted(TRANSCRIPTS_DIR.glob("*.txt"), reverse=True):
+    for path in sorted((TRANSCRIPTS_DIR / user).glob("*.txt"), reverse=True):
         if len(results) >= limit:
             break
         if path.name.startswith("."):
@@ -1172,7 +1359,7 @@ def search_transcripts():
         start = max(0, idx - 120)
         end = min(len(text), idx + len(query) + 120)
         results.append({
-            "id": by_path.get(str(path)) or _transcript_job_id(path.name),
+            "id": by_path.get(str(path)) or _transcript_job_id(f"{user}/{path.name}"),
             "filename": path.name,
             "created_at": path.stat().st_mtime,
             "snippet": ("…" if start > 0 else "")
@@ -1184,8 +1371,7 @@ def search_transcripts():
 
 @app.route("/api/download/<job_id>/<fmt>")
 def download_result(job_id, fmt):
-    with jobs_lock:
-        job = jobs.get(job_id)
+    job = owned_job(job_id, current_user(request))
     if not job or job["status"] != "done":
         return jsonify({"error": "Not ready"}), 404
 
