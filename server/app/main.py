@@ -103,6 +103,24 @@ def _transcript_job_id(filename: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"whisper-transcript:{filename}"))
 
 
+# Guessing by extension gets .webm wrong: it maps to video/webm, but the browser
+# recorder produces an audio-only stream. Players and the OS then treat a memo as
+# a video file, so pin the types we actually accept.
+AUDIO_MIMETYPES = {
+    ".webm": "audio/webm",
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".flac": "audio/flac",
+}
+
+
+def audio_mimetype(path) -> str:
+    return AUDIO_MIMETYPES.get(Path(path).suffix.lower(), "application/octet-stream")
+
+
 def find_audio(stem: str):
     """The archived recording belonging to a transcript stem, if it is still there.
 
@@ -1016,7 +1034,13 @@ def get_audio(job_id):
     audio_file = job.get("audio_file", "")
     if not audio_file or not os.path.exists(audio_file):
         return jsonify({"error": "Keine Aufnahme vorhanden"}), 404
+    # ?download=1 turns this into a save instead of playback. Without
+    # as_attachment the disposition is "inline", and the browser offers no way
+    # to keep the file — which is what the player alone left us with.
+    as_attachment = request.args.get("download", "") in ("1", "true", "yes")
     return send_file(audio_file, conditional=True,
+                     mimetype=audio_mimetype(audio_file),
+                     as_attachment=as_attachment,
                      download_name=Path(audio_file).name)
 
 

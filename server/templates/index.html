@@ -392,6 +392,7 @@ function renderJobs(jobs) {
         actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="downloadFmt('${job.id}','srt')">SRT</button>`;
         actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="downloadFmt('${job.id}','json')">JSON</button>`;
         if (job.has_audio) {
+          actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="downloadAudio('${job.id}')">Audio</button>`;
           actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="deleteAudio('${job.id}')">Audio löschen</button>`;
         }
       }
@@ -511,6 +512,12 @@ async function deleteJob(id) {
   await apiFetch(`/api/jobs/${id}/delete`, {method:'DELETE'});
   delete knownJobs[id];
   refreshJobs();
+}
+
+function downloadAudio(id) {
+  // ?download=1 setzt Content-Disposition auf attachment; das Session-Cookie
+  // geht bei same-origin automatisch mit, wie beim TXT-Download auch.
+  location.href = `/api/jobs/${id}/audio?download=1`;
 }
 
 async function deleteAudio(id) {
