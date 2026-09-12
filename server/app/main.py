@@ -33,12 +33,17 @@ TRANSCRIPTS_DIR = Path(os.environ.get("TRANSCRIPTS_DIR", "/transcripts"))
 # retention job. Separate mount from the transcripts so the bulky part can be
 # backed up, moved or cleared on its own.
 AUDIO_DIR = Path(os.environ.get("AUDIO_DIR", "/audio"))
+# Converted copies live in a subdirectory, not beside the originals: find_audio()
+# globs AUDIO_DIR by stem and would otherwise pair a recording with its own
+# conversion. Dot-prefixed because it is derived data, not an archive.
+M4A_CACHE_DIR = AUDIO_DIR / ".m4a"
 MODEL_CACHE_DIR = Path("/model_cache")
 TOKENS_FILE = TRANSCRIPTS_DIR / ".tokens.json"
 MODELS_FILE = TRANSCRIPTS_DIR / ".models.json"
 SESSIONS_DIR = TRANSCRIPTS_DIR / ".recording-sessions"
 TRANSCRIPTS_DIR.mkdir(exist_ok=True)
 AUDIO_DIR.mkdir(exist_ok=True)
+M4A_CACHE_DIR.mkdir(exist_ok=True)
 SESSIONS_DIR.mkdir(exist_ok=True)
 
 # Built-in models always available (downloaded by faster-whisper on demand)
@@ -119,6 +124,52 @@ AUDIO_MIMETYPES = {
 
 def audio_mimetype(path) -> str:
     return AUDIO_MIMETYPES.get(Path(path).suffix.lower(), "application/octet-stream")
+
+
+# The browser recorder produces WebM/Opus. Browsers play it natively, but
+# QuickTime, most Windows players, dictation software and car stereos do not —
+# and AVAudioPlayer in the iOS app cannot open it at all. Everything else we
+# accept already plays broadly, so it is passed through untouched rather than
+# re-encoded for nothing.
+NEEDS_TRANSCODE = {".webm", ".ogg"}
+
+
+def m4a_for(source: str) -> Path:
+    """AAC/m4a copy of a recording, converted once and then kept.
+
+    Converting is not free — a 40 minute memo takes around 25 seconds — so the
+    result is cached rather than rebuilt per download. Mono at 64k is plenty for
+    speech, and the rewrite fixes the missing duration header that MediaRecorder
+    leaves behind, which is why some players show no length and refuse to seek.
+
+    Written to a temp name and renamed into place, so an interrupted conversion
+    cannot leave a truncated file that later downloads would happily serve.
+    """
+    target = M4A_CACHE_DIR / (Path(source).stem + ".m4a")
+    if target.exists() and target.stat().st_size > 0:
+        return target
+
+    tmp = target.with_suffix(".m4a.part")
+    subprocess.run(
+        ["ffmpeg", "-nostdin", "-y", "-i", source,
+         "-vn", "-ac", "1", "-c:a", "aac", "-b:a", "64k",
+         "-movflags", "+faststart", str(tmp)],
+        check=True, capture_output=True,
+    )
+    tmp.replace(target)
+    return target
+
+
+def drop_m4a_cache(source: str) -> None:
+    """Remove the converted copy belonging to a recording."""
+    if not source:
+        return
+    cached = M4A_CACHE_DIR / (Path(source).stem + ".m4a")
+    for leftover in (cached, cached.with_suffix(".m4a.part")):
+        try:
+            leftover.unlink()
+        except OSError:
+            pass
 
 
 def find_audio(stem: str):
@@ -970,6 +1021,7 @@ def delete_job(job_id):
         except Exception:
             pass
     audio_file = job.get("audio_file", "")
+    drop_m4a_cache(audio_file)
     if audio_file and os.path.exists(audio_file):
         try:
             os.remove(audio_file)
@@ -1038,6 +1090,21 @@ def get_audio(job_id):
     # as_attachment the disposition is "inline", and the browser offers no way
     # to keep the file — which is what the player alone left us with.
     as_attachment = request.args.get("download", "") in ("1", "true", "yes")
+
+    # ?format=m4a asks for something that plays anywhere. Formats that already
+    # do are handed over unchanged — re-encoding them would only cost quality.
+    if request.args.get("format", "") == "m4a" and \
+            Path(audio_file).suffix.lower() in NEEDS_TRANSCODE:
+        try:
+            converted = m4a_for(audio_file)
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or b"").decode(errors="replace")[-400:]
+            print(f"ffmpeg failed for {audio_file}: {stderr}", flush=True)
+            return jsonify({"error": "Umwandlung fehlgeschlagen"}), 500
+        return send_file(converted, conditional=True, mimetype="audio/mp4",
+                         as_attachment=as_attachment,
+                         download_name=converted.name)
+
     return send_file(audio_file, conditional=True,
                      mimetype=audio_mimetype(audio_file),
                      as_attachment=as_attachment,
@@ -1057,6 +1124,7 @@ def delete_audio(job_id):
             return jsonify({"error": "Not found"}), 404
         audio_file = job.get("audio_file", "")
         job["audio_file"] = ""
+    drop_m4a_cache(audio_file)
     if audio_file and os.path.exists(audio_file):
         try:
             os.remove(audio_file)

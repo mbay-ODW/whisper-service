@@ -517,7 +517,8 @@ async function deleteJob(id) {
 function downloadAudio(id) {
   // ?download=1 setzt Content-Disposition auf attachment; das Session-Cookie
   // geht bei same-origin automatisch mit, wie beim TXT-Download auch.
-  location.href = `/api/jobs/${id}/audio?download=1`;
+  // format=m4a: WebM-Aufnahmen kommen als AAC zurück, alles andere unverändert.
+  location.href = `/api/jobs/${id}/audio?download=1&format=m4a`;
 }
 
 async function deleteAudio(id) {
