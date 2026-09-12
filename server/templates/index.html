@@ -70,6 +70,7 @@ select{min-width:140px}
 .progress-fill{height:100%;background:linear-gradient(90deg,#6366f1,#8b5cf6);transition:width .3s;border-radius:2px}
 
 /* Transcript */
+.current-user{font-size:.8rem;font-weight:400;color:#94a3b8;margin-left:8px}
 .audio-player{width:100%;margin-top:10px;height:34px}
 .transcript{background:#0f1117;border:1px solid #1e2432;border-radius:6px;padding:12px;margin-top:10px;font-size:.8rem;line-height:1.6;white-space:pre-wrap;max-height:260px;overflow-y:auto;color:#cbd5e1}
 .segments-toggle{font-size:.75rem;color:#6366f1;cursor:pointer;background:none;border:none;padding:0;margin-top:6px}
@@ -126,7 +127,7 @@ select{min-width:140px}
 </style>
 </head>
 <body>
-<h1>Whisper Transkription</h1>
+<h1>Whisper Transkription <span id="currentUser" class="current-user"></span></h1>
 <p class="subtitle">Selbst gehostete Sprache-zu-Text-Transkription</p>
 
 <div id="model-status">
@@ -596,6 +597,10 @@ function showToast(msg, isError = false) {
   toastTimer = setTimeout(() => t.classList.remove('show'), 3000);
 }
 
+// Wer ist angemeldet? Rein informativ — die Trennung macht der Server.
+fetch('/api/config').then(r => r.json()).then(cfg => {
+  if (cfg.user) document.getElementById('currentUser').textContent = '— ' + cfg.user;
+}).catch(() => {});
 refreshJobs();
 
 // Token management (only shown for browser sessions authenticated via Authelia)
