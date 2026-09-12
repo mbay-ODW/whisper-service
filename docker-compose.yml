@@ -15,6 +15,10 @@ services:
       # Apps-Pool neu initialisiert wird. Transkripte sind die einzigen
       # unersetzlichen Daten hier; der Modell-Cache bleibt regenerierbar.
       - /mnt/apps/whisper/transcripts:/transcripts
+      # Sprachaufnahmen. Eigener Mount, weil das der dicke Teil ist und
+      # unabhängig vom Text gesichert oder geleert werden können soll.
+      # Es gibt bewusst KEINE automatische Löschung — nur von Hand.
+      - /mnt/apps/whisper/audio:/audio
     networks:
       - traefik
     labels:

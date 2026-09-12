@@ -70,6 +70,7 @@ select{min-width:140px}
 .progress-fill{height:100%;background:linear-gradient(90deg,#6366f1,#8b5cf6);transition:width .3s;border-radius:2px}
 
 /* Transcript */
+.audio-player{width:100%;margin-top:10px;height:34px}
 .transcript{background:#0f1117;border:1px solid #1e2432;border-radius:6px;padding:12px;margin-top:10px;font-size:.8rem;line-height:1.6;white-space:pre-wrap;max-height:260px;overflow-y:auto;color:#cbd5e1}
 .segments-toggle{font-size:.75rem;color:#6366f1;cursor:pointer;background:none;border:none;padding:0;margin-top:6px}
 .segments-toggle:hover{color:#818cf8}
@@ -390,6 +391,9 @@ function renderJobs(jobs) {
         actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="downloadFmt('${job.id}','txt')">TXT</button>`;
         actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="downloadFmt('${job.id}','srt')">SRT</button>`;
         actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="downloadFmt('${job.id}','json')">JSON</button>`;
+        if (job.has_audio) {
+          actionsHtml += `<button class="btn btn-ghost btn-sm" onclick="deleteAudio('${job.id}')">Audio löschen</button>`;
+        }
       }
       if (canDelete) actionsHtml += `<button class="btn btn-danger btn-sm" onclick="deleteJob('${job.id}')">Löschen</button>`;
 
@@ -444,6 +448,17 @@ async function loadJobDetail(jobId, container, isExpanded) {
 function appendTranscript(container, job, isExpanded) {
   if (!job || !job.full_text) return;
 
+  // Aufnahme, falls noch vorhanden. Das <audio>-Element holt sich die Datei
+  // selbst — same-origin, also geht das Session-Cookie automatisch mit.
+  if (job.has_audio) {
+    const audio = document.createElement('audio');
+    audio.className = 'audio-player';
+    audio.controls = true;
+    audio.preload = 'none';
+    audio.src = `/api/jobs/${job.id}/audio`;
+    container.appendChild(audio);
+  }
+
   const transcriptDiv = document.createElement('div');
   transcriptDiv.className = 'transcript';
   transcriptDiv.textContent = job.full_text;
@@ -495,6 +510,14 @@ async function retryJob(id) {
 async function deleteJob(id) {
   await apiFetch(`/api/jobs/${id}/delete`, {method:'DELETE'});
   delete knownJobs[id];
+  refreshJobs();
+}
+
+async function deleteAudio(id) {
+  if (!confirm('Aufnahme löschen? Das Transkript bleibt erhalten.')) return;
+  await apiFetch(`/api/jobs/${id}/audio`, {method:'DELETE'});
+  delete knownJobs[id];
+  showToast('Aufnahme gelöscht');
   refreshJobs();
 }
 

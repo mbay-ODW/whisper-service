@@ -1,4 +1,5 @@
 import os
+import glob
 import uuid
 import json
 import time
@@ -28,11 +29,16 @@ app.config["MAX_CONTENT_LENGTH"] = _max_mb * 1024 * 1024
 TRUST_PROXY_AUTH = os.environ.get("TRUST_PROXY_AUTH", "true").lower() == "true"
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
 TRANSCRIPTS_DIR = Path(os.environ.get("TRANSCRIPTS_DIR", "/transcripts"))
+# Recordings are kept indefinitely and only ever removed by hand — there is no
+# retention job. Separate mount from the transcripts so the bulky part can be
+# backed up, moved or cleared on its own.
+AUDIO_DIR = Path(os.environ.get("AUDIO_DIR", "/audio"))
 MODEL_CACHE_DIR = Path("/model_cache")
 TOKENS_FILE = TRANSCRIPTS_DIR / ".tokens.json"
 MODELS_FILE = TRANSCRIPTS_DIR / ".models.json"
 SESSIONS_DIR = TRANSCRIPTS_DIR / ".recording-sessions"
 TRANSCRIPTS_DIR.mkdir(exist_ok=True)
+AUDIO_DIR.mkdir(exist_ok=True)
 SESSIONS_DIR.mkdir(exist_ok=True)
 
 # Built-in models always available (downloaded by faster-whisper on demand)
@@ -97,6 +103,18 @@ def _transcript_job_id(filename: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"whisper-transcript:{filename}"))
 
 
+def find_audio(stem: str):
+    """The archived recording belonging to a transcript stem, if it is still there.
+
+    Transcript and recording share a base name and differ only in the
+    extension, which depends on what the client uploaded.
+    """
+    for candidate in AUDIO_DIR.glob(f"{glob.escape(stem)}.*"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def read_transcript(job) -> str:
     """Transcript text for a job, read from disk if it is not in memory.
 
@@ -147,6 +165,7 @@ def _rehydrate_jobs() -> None:
         except ValueError:
             created = path.stat().st_mtime
         job_id = _transcript_job_id(path.name)
+        audio = find_audio(path.stem)
         jobs[job_id] = {
             "id": job_id,
             "status": "done",
@@ -154,6 +173,7 @@ def _rehydrate_jobs() -> None:
             "original_filename": original_name,
             "file_path": "",          # source audio is long gone
             "transcript_file": str(path),
+            "audio_file": str(audio) if audio else "",
             "created_at": created,
             "finished_at": created,
             "segments": [],           # only the plain text survived
@@ -399,12 +419,26 @@ def transcribe_job(job_id: str):
         txt_path = TRANSCRIPTS_DIR / txt_filename
         txt_path.write_text(full_text, encoding="utf-8")
 
+        # Keep the recording. Same base name as the transcript so the two are
+        # obviously a pair on disk and _rehydrate_jobs() can pair them up again.
+        audio_path = None
+        source_audio = job.get("file_path", "")
+        if source_audio and os.path.exists(source_audio):
+            suffix = Path(job["original_filename"]).suffix or Path(source_audio).suffix
+            candidate = AUDIO_DIR / f"{date_str}_{original_name}{suffix}"
+            try:
+                shutil.move(source_audio, candidate)
+                audio_path = candidate
+            except Exception as e:
+                print(f"Could not archive audio for {job_id}: {e}", flush=True)
+
         with jobs_lock:
             jobs[job_id]["status"] = "done"
             jobs[job_id]["progress"] = 100
             jobs[job_id]["segments"] = segments
             jobs[job_id]["full_text"] = full_text
             jobs[job_id]["transcript_file"] = str(txt_path)
+            jobs[job_id]["audio_file"] = str(audio_path) if audio_path else ""
             jobs[job_id]["duration"] = round(info.duration, 1) if info.duration else 0
             jobs[job_id]["language"] = info.language
             jobs[job_id]["finished_at"] = time.time()
@@ -417,7 +451,9 @@ def transcribe_job(job_id: str):
     finally:
         if tmp_dir and os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
-        # Only delete the uploaded audio file on success — keep it for error/cancelled so retry works
+        # On success the upload has already been moved into AUDIO_DIR above, so
+        # nothing is left here. This only cleans up the case where the move
+        # failed. Error/cancelled keep their upload so retry still works.
         with jobs_lock:
             job = jobs.get(job_id, {})
         if job.get("status") == "done":
@@ -829,6 +865,7 @@ def list_jobs():
                 "finished_at": job.get("finished_at"),
                 "error": job.get("error"),
                 "duration": job.get("duration"),
+                "has_audio": bool(job.get("audio_file")),
             })
     return jsonify(result)
 
@@ -853,6 +890,7 @@ def get_job(job_id):
         "duration": job.get("duration"),
         "language": job.get("language"),
         "restored": job.get("restored", False),
+        "has_audio": bool(job.get("audio_file")),
     })
 
 
@@ -913,6 +951,12 @@ def delete_job(job_id):
             os.remove(transcript_file)
         except Exception:
             pass
+    audio_file = job.get("audio_file", "")
+    if audio_file and os.path.exists(audio_file):
+        try:
+            os.remove(audio_file)
+        except Exception:
+            pass
     return jsonify({"ok": True})
 
 
@@ -956,6 +1000,45 @@ def api_transcribe():
 
     job_queue.put(job_id)
     return jsonify({"job_id": job_id, "status": "queued"}), 202
+
+
+@app.route("/api/jobs/<job_id>/audio")
+def get_audio(job_id):
+    """Stream the archived recording.
+
+    conditional=True makes Flask honour Range requests, without which a player
+    can only play straight through and cannot seek.
+    """
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Not found"}), 404
+    audio_file = job.get("audio_file", "")
+    if not audio_file or not os.path.exists(audio_file):
+        return jsonify({"error": "Keine Aufnahme vorhanden"}), 404
+    return send_file(audio_file, conditional=True,
+                     download_name=Path(audio_file).name)
+
+
+@app.route("/api/jobs/<job_id>/audio", methods=["DELETE"])
+def delete_audio(job_id):
+    """Drop the recording but keep the transcript.
+
+    The recording is the bulky half; the text is usually worth keeping. There
+    is no automatic retention — this only ever runs when someone asks for it.
+    """
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Not found"}), 404
+        audio_file = job.get("audio_file", "")
+        job["audio_file"] = ""
+    if audio_file and os.path.exists(audio_file):
+        try:
+            os.remove(audio_file)
+        except Exception as e:
+            return jsonify({"error": f"Löschen fehlgeschlagen: {e}"}), 500
+    return jsonify({"ok": True})
 
 
 @app.route("/api/transcripts/search")
